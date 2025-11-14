@@ -8,6 +8,9 @@ from jax.experimental.pallas import tpu as pltpu
 from jax import random
 import jax.numpy as jnp
 import numpy as np
+import time
+import statistics as stats
+
 
 dimension_numbers = (((1,), (1,)), ((), ()))
 MIN_BLOCK_SIZE = 128
@@ -266,18 +269,154 @@ def make_flash_attention_kernel(mask_fn=None):
     @pl.when(kv_seq_idx == (kv_seq_len // block_k_major) - 1)
     def store_res():
       O_tile_ref[batch_idx] = O_scratch_ref[batch_idx].astype(O_tile_ref.dtype)
-      m_tile_ref[batch_idx] = m_scratch_ref[batch_idx].astype(m_tile_ref.dtype)
-      l_tile_ref[batch_idx] = l_scratch_ref[batch_idx].astype(l_tile_ref.dtype)
+      # Only store m/l if they were requested (i.e., not None)
+      if (m_tile_ref is not None) and (l_tile_ref is not None):
+        m_tile_ref[batch_idx] = m_scratch_ref[batch_idx].astype(m_tile_ref.dtype)
+        l_tile_ref[batch_idx] = l_scratch_ref[batch_idx].astype(l_tile_ref.dtype)
 
   return flash_attention_fwd_kernel
 
+def flop_count_attention(b, h, q, k, d):
+    """
+    Rough FLOP count for one forward pass of scaled dot-product attention:
+      QK^T  : 2 * b * h * q * k * d        (matrix multiplication)
+      Softmax: ~ b * h * q * k             (small, we ignore it)
+      (softmax @ V): 2 * b * h * q * k * d (another matmul)
+    Total ≈ 4 * b * h * q * k * d FLOPs
+    """
+    return 4.0 * b * h * q * k * d
+
+def benchmark(fn, args, iters=30, warmup=5, name="fn"):
+    # 1. Warmup phase — triggers JIT compilation and stabilizes cache
+    for _ in range(warmup):
+        y = fn(*args)
+        # .block_until_ready() ensures we wait until computation is finished
+        if isinstance(y, (tuple, list)):
+            jax.tree_util.tree_map(
+                lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, y
+            )
+        else:
+            y.block_until_ready()
+
+    # 2. Timed runs
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        y = fn(*args)
+        # Synchronize (very important for accurate timing)
+        if isinstance(y, (tuple, list)):
+            jax.tree_util.tree_map(
+                lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, y
+            )
+        else:
+            y.block_until_ready()
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+
+    # 3. Compute summary statistics
+    mean_t = sum(times) / len(times)
+    med_t = stats.median(times)
+    p10, p90 = np.percentile(np.array(times), [10, 90])
+
+    print(f"[{name}] mean={mean_t*1e3:.2f} ms  median={med_t*1e3:.2f} ms  "
+          f"p10={p10*1e3:.2f} ms  p90={p90*1e3:.2f} ms")
+
+    # Return average and median latency (seconds)
+    return mean_t, med_t
+
+def build_fns_for_bench(
+    q, k, v,
+    *,
+    ab=None,
+    sm_scale=1.0,
+    save_residuals=False,
+    causal=False,
+    block_b=1,
+    block_q=128,
+    block_k_major=128,
+    block_k=128,
+    debug=False,
+):
+    # JIT-compile reference implementation
+    ref_fn = functools.partial(mha_reference, ab=None, sm_scale=sm_scale, save_residuals=False)
+    ref_jit = jax.jit(ref_fn)
+
+    # JIT-compile your custom Pallas kernel implementation
+    flash_partial = functools.partial(
+        _flash_attention_impl,
+        ab=ab,
+        segment_ids=None,
+        save_residuals=save_residuals,
+        causal=causal,
+        sm_scale=sm_scale,
+        block_b=block_b,
+        block_q=block_q,
+        block_k_major=block_k_major,
+        block_k=block_k,
+        debug=debug,
+    )
+    flash_jit = jax.jit(flash_partial)
+
+    return ref_jit, flash_jit
+
+def run_bench_suite(q, k, v, *, sm_scale, block_b, block_q, block_k_major, block_k, causal=False):
+    # Unpack shapes
+    b, h, q_len, d = q.shape
+    _, _, k_len, _ = k.shape
+
+    # Compute FLOPs (for throughput calculation)
+    gflops = flop_count_attention(b, h, q_len, k_len, d) / 1e9
+
+    # Create JIT-compiled versions of both implementations
+    ref_jit, flash_jit = build_fns_for_bench(
+        q, k, v,
+        sm_scale=sm_scale,
+        save_residuals=False,  # exclude residual buffers for fair comparison
+        causal=causal,
+        block_b=block_b,
+        block_q=block_q,
+        block_k_major=block_k_major,
+        block_k=block_k,
+        debug=False,
+    )
+
+    print(f"\n== Benchmark config: b={b}, h={h}, q={q_len}, k={k_len}, d={d}, causal={causal} ==")
+    print(f"Estimated FLOPs per call: {gflops:.2f} GFLOPs")
+
+    # ---- Reference (naive) implementation ----
+    t_mean_ref, t_med_ref = benchmark(ref_jit, (q, k, v), name="mha_reference[jit]")
+    print(f"  → Throughput: {gflops / t_med_ref:.2f} GFLOP/s")
+
+    # ---- Pallas FlashAttention kernel ----
+    t_mean_flash, t_med_flash = benchmark(flash_jit, (q, k, v), name="pallas_flash[jit]")
+    print(f"  → Throughput: {gflops / t_med_flash:.2f} GFLOP/s")
+
+    # ---- Numeric correctness check ----
+    o_ref = ref_jit(q, k, v).block_until_ready()
+    o_flash = flash_jit(q, k, v)
+    if isinstance(o_flash, (tuple, list)):
+        o_flash = o_flash[0]
+    o_flash = o_flash.block_until_ready()
+
+    # Relative L2 error measures numerical difference between both results
+    rel_err = jnp.linalg.norm(o_flash - o_ref) / jnp.linalg.norm(o_ref)
+    print(f"Numeric diff (Relative L2): {rel_err:.3e}")
+
+    # Return summarized metrics
+    return {
+        "ref_ms_med": t_med_ref * 1e3,
+        "flash_ms_med": t_med_flash * 1e3,
+        "ref_gflops": gflops / t_med_ref,
+        "flash_gflops": gflops / t_med_flash,
+        "rel_l2": float(rel_err),
+    }
 
 def main():
   key = random.PRNGKey(0)
   batch = 1
   heads = 1
-  q_len = 256
-  kv_len = 256
+  q_len = 25600
+  kv_len = 25600
   head_dim = 128
 
   k1, k2, k3 = random.split(key, 3)
@@ -288,8 +427,8 @@ def main():
   segment_ids = None
 
   block_b = 1
-  block_q = 128
-  block_k_major = 128
+  block_q = 512
+  block_k_major = 512
   block_k = 128
 
   causal = False
@@ -314,10 +453,25 @@ def main():
   else:
     o = out
 
+# correctness check
+
   diff = jnp.linalg.norm(o - ref) / jnp.linalg.norm(ref)
   print(f"Relative L2 error vs reference: {diff:.3e}")
   print("Output shape:", o.shape)
 
+#performence comparison
+# Run the benchmark comparison
+  results = run_bench_suite(
+      q, k, v,
+      sm_scale=sm_scale,
+      block_b=block_b,
+      block_q=block_q,
+      block_k_major=block_k_major,
+      block_k=block_k,
+      causal=causal,
+  )
+
+  print("\nSummary:", results)
 
 if __name__ == "__main__":
   main()
