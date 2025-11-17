@@ -17,7 +17,7 @@ def _flash_attention_bwd(q_tile_ref, *args, **kwargs):
     block_b = q_tile_ref.shape[0]
 
     # Create the real kernel from the factory
-    kernel = flash_attention_bwd_kernel()
+    kernel = flash_attention_bwd_kernel
 
     for batch_idx in range(block_b):
         kernel(
@@ -53,7 +53,7 @@ def flash_attention_bwd(
     grid = (
         pl.cdiv(batch_size, block_b),
         head_num,
-        q_seq_len // block_q_major,
+        pl.cdiv(q_seq_len, block_q_major),
         pl.cdiv(kv_seq_len, block_k_major),
     )
 
@@ -64,19 +64,19 @@ def flash_attention_bwd(
     do_spec = qo_spec
 
     def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
-        if causal:
-        # If the kv block is skipped, prefetch the next valid kv block, i.e. the
-        # 0th one to be used for the next block_q rows.
-            next_kv_index = lax.select(
-            below_or_on_diag(
-                q_seq_index, block_q_major, kv_seq_index, block_k_major
-            ),
-            kv_seq_index,
-            0,
-            )
-        else:
-            next_kv_index = kv_seq_index
-            return (batch_index, head_index, next_kv_index, 0)
+        # if causal:
+        # # If the kv block is skipped, prefetch the next valid kv block, i.e. the
+        # # 0th one to be used for the next block_q rows.
+        #     next_kv_index = lax.select(
+        #     below_or_on_diag(
+        #         q_seq_index, block_q_major, kv_seq_index, block_k_major
+        #     ),
+        #     kv_seq_index,
+        #     0,
+        #     )
+        # else:
+        next_kv_index = kv_seq_index
+        return (batch_index, head_index, next_kv_index, 0)
         
     kv_spec = pl.BlockSpec((batch_size, head_num, kv_seq_len, head_dim), kv_index_map)
     assert kv_spec.block_shape is not None
@@ -101,9 +101,8 @@ def flash_attention_bwd(
 
     # Allocate scratch buffers
     if block_k != kv_seq_len:
-        # dq_scratch = pltpu.VMEM((block_b, 1, block_q_major, head_dim), jnp.float32)
-        dk_scratch = pltpu.VMEM((block_b, 1, block_k_major, MIN_BLOCK_SIZE), jnp.float32)
-        dv_scratch = pltpu.VMEM((block_b, 1, block_k_major, MIN_BLOCK_SIZE), jnp.float32)
+        dk_scratch = pltpu.VMEM((block_b, 1, block_k_major, head_dim), jnp.float32)
+        dv_scratch = pltpu.VMEM((block_b, 1, block_k_major, head_dim), jnp.float32)
         # scratch_shapes = [dq_scratch, dk_scratch, dv_scratch]
         scratch_shapes = [dk_scratch, dv_scratch]
     else:
@@ -183,7 +182,6 @@ def flash_attention_bwd_kernel(
       dv_tile_ref,
     #   m_tile_ref,
       l_tile_ref,
-      dq_scratch_ref,
       dk_scratch_ref, 
       dv_scratch_ref,
     #   O_scratch_ref,
@@ -197,21 +195,20 @@ def flash_attention_bwd_kernel(
   ):
     _, _, q_seq_length = q_tile_ref.shape
     
-    kv_tile_idx = pl.program_id(axis = 2)
-    o_tile_idx = pl.program_id(axis = 2)
+    kv_tile_idx = pl.program_id(axis = 3)
+    q_tile_idx = pl.program_id(axis = 2)
 
-    dk_scratch_ref[:, :] = jnp.zeros(dk_scratch_ref.shape, dk_scratch_ref.dtype)
-    dv_scratch_ref[:, :] = jnp.zeros(dv_scratch_ref.shape, dv_scratch_ref.dtype)
-    
     k = k_tile_ref[batch_idx]
     v = v_tile_ref[batch_idx]
 
     D = jnp.sum(dO_tile_ref * O_tile_ref, axis = -1)
     block_q_repeats, rem = divmod(block_q, MIN_BLOCK_SIZE)
     @pl.when(kv_tile_idx == 0)
-    # def start_new_q_tile():
+    def start_new_kv_seq():
         # dq_scratch_ref[:, :] = jnp.zeros(dq_scratch_ref.shape, dq_scratch_ref.dtype)
-        
+        dk_scratch_ref[batch_idx] = jnp.zeros(dk_scratch_ref[2:].shape, dk_scratch_ref.dtype)
+        dv_scratch_ref[batch_idx] = jnp.zeros(dv_scratch_ref[2:].shape, dv_scratch_ref.dtype)
+    
     def body():
         @pl.loop(0, q_seq_length, step=block_q, unroll=True)
         def _body(start_q):
@@ -228,23 +225,29 @@ def flash_attention_bwd_kernel(
 
             S = jax.lax.dot_general(q, k, dimension_numbers, preferred_element_type=jnp.float32)
             P = jnp.exp(S - pltpu.repeat(l, block_q_repeats, 1))
-            dv = dv_past + jnp.einsum('rb, rd->bd', P, dO)
+            # dv = dv_past + jnp.einsum('rb, rd->bd', P, dO)
+            dv = dv_past + jax.lax.dot_general(P,dO,dimension_numbers,preferred_element_type=jnp.float32)
             dv_scratch_ref[batch_idx] = dv
 
-            dP = jnp.einsum("bhqc,bhkc->bhqk", dO, v)
+            # dP = jnp.einsum("qc,kc->qk", dO, v)
+            dP = jax.lax.dot_general(dO,v,dimension_numbers,preferred_element_type=jnp.float32)
             dS = P * (dP - D)
 
             # dq = dq_past + jnp.einsum("bhqk,bhkc->bhqc", dS, k)
-            dq = dq + jnp.einsum("bhqk,bhkc->bhqc", dS, k)
-
-            dk = dk_past + jnp.einsum("bhqk,bhqc->bhkc", dS, q)
+            # dq = dq + jnp.einsum("bhqk,bhkc->bhqc", dS, k)
+            dq = dq + jax.lax.dot_general(dS,k,dimension_numbers,preferred_element_type=jnp.float32)
+            
+            # dk = dk_past + jnp.einsum("bhqk,bhqc->bhkc", dS, q)
+            dk = dk_past + jax.lax.dot_general(dS,q,dimension_numbers,preferred_element_type=jnp.float32)
             dk_scratch_ref[batch_idx] = dk
 
             dq_tile_ref[start_q] = dq.astype(dq_tile_ref.dtype)
 
-    # @pl.when(q_tile_idx == (q_seq_len // block_q) - 1)
+    @pl.when(q_tile_idx == (q_seq_len // block_q) - 1)
     def store_res():
       dk_tile_ref[batch_idx] = dk_scratch_ref[batch_idx].astype(dk_tile_ref.dtype)
       dv_tile_ref[batch_idx] = dv_scratch_ref[batch_idx].astype(dv_tile_ref.dtype)
             
-    return flash_attention_bwd_kernel
+    # return flash_attention_bwd_kernel
+
+

@@ -207,8 +207,8 @@ def make_flash_attention_kernel(mask_fn=None):
       block_k,
       kv_seq_len,
   ):
-    block_k_major = 128
-    head_dim = 128
+    block_k_major = k_tile_ref.shape[2]
+    head_dim = k_tile_ref.shape[3]
     kv_seq_idx = pl.program_id(3)
 
     @pl.when(kv_seq_idx == 0)
@@ -411,67 +411,3 @@ def run_bench_suite(q, k, v, *, sm_scale, block_b, block_q, block_k_major, block
         "rel_l2": float(rel_err),
     }
 
-def main():
-  key = random.PRNGKey(0)
-  batch = 1
-  heads = 1
-  q_len = 25600
-  kv_len = 25600
-  head_dim = 128
-
-  k1, k2, k3 = random.split(key, 3)
-  q = random.normal(k1, (batch, heads, q_len, head_dim), dtype=jnp.float32)
-  k = random.normal(k2, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
-  v = random.normal(k3, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
-  ab = None
-  segment_ids = None
-
-  block_b = 1
-  block_q = 512
-  block_k_major = 512
-  block_k = 128
-
-  causal = False
-  sm_scale = float(1.0 / jnp.sqrt(head_dim).astype(jnp.float32))
-  debug = False
-  save_residuals = True
-
-  print("Running reference attention (for numeric check)...")
-  ref = mha_reference(q, k, v, sm_scale=sm_scale)
-
-  print("Running Pallas TPU flash attention kernel...")
-  out = _flash_attention_impl(
-      q=q, k=k, v=v, ab=ab, segment_ids=segment_ids,
-      save_residuals=save_residuals,
-      causal=causal, sm_scale=sm_scale,
-      block_b=block_b, block_q=block_q,
-      block_k_major=block_k_major, block_k=block_k,
-      debug=debug,
-  )
-  if save_residuals:
-    o, l, m = out
-  else:
-    o = out
-
-# correctness check
-
-  diff = jnp.linalg.norm(o - ref) / jnp.linalg.norm(ref)
-  print(f"Relative L2 error vs reference: {diff:.3e}")
-  print("Output shape:", o.shape)
-
-#performence comparison
-# Run the benchmark comparison
-  results = run_bench_suite(
-      q, k, v,
-      sm_scale=sm_scale,
-      block_b=block_b,
-      block_q=block_q,
-      block_k_major=block_k_major,
-      block_k=block_k,
-      causal=causal,
-  )
-
-  print("\nSummary:", results)
-
-if __name__ == "__main__":
-  main()
