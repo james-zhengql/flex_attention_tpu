@@ -33,7 +33,7 @@ def lift_scalar_score_fn_to_block(user_score_fn):
 
 
 def _flash_attention_kernel(q_tile_ref, *args, score_fn=None,
-    score_ctx=None, **kwargs):
+    **kwargs):
     """Connects _flash_attention_impl to the generated kernel."""
     block_b = q_tile_ref.shape[0]
 
@@ -41,7 +41,6 @@ def _flash_attention_kernel(q_tile_ref, *args, score_fn=None,
     # ---------------------------------------------
     kernel = make_flash_attention_kernel(
         score_fn=score_fn,
-        score_ctx=score_ctx,
     )
 
     for batch_idx in range(block_b):
@@ -69,7 +68,6 @@ def _flash_attention_impl(
     block_k,
     debug,
     score_fn,
-    score_ctx
 ):
   batch_size, num_heads, q_seq_len, head_dim = q.shape
   _, _, kv_seq_len, _ = k.shape
@@ -117,7 +115,6 @@ def _flash_attention_impl(
       block_k = block_k,
       kv_seq_len = kv_seq_len,
       score_fn = score_fn,
-      score_ctx = score_ctx
   )
 
   out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
@@ -185,7 +182,7 @@ def _flash_attention_impl(
     return o
 
 
-def make_flash_attention_kernel(mask_fn=None,score_fn=None, score_ctx=None):
+def make_flash_attention_kernel(mask_fn=None,score_fn=None):
   """Factory returning a kernel with an optional custom mask function."""
   def flash_attention_fwd_kernel(
       batch_idx,
@@ -242,7 +239,7 @@ def make_flash_attention_kernel(mask_fn=None,score_fn=None, score_ctx=None):
           S *= sm_scale
         else:
           # User-defined score
-          S = score_fn(q_ref, k_ref, score_ctx)   
+          S = score_fn(q_ref, k_ref)   
 
         if ab_tile_ref is not None:
           ab = ab_tile_ref[

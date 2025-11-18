@@ -1,8 +1,15 @@
-
+import jax
 from jax import random
 
 import jax.numpy as jnp
 import benchmark
+
+from typing import NamedTuple
+from constants import dimension_numbers
+
+class ScoreContext(NamedTuple):
+    scale: jnp.ndarray
+    alpha: jnp.ndarray
 
 def main():
     key = random.PRNGKey(0)
@@ -33,23 +40,35 @@ def main():
     # ⭐️ USER-DEFINED SCORE FUNCTION + CONTEXT
     # ------------------------------------------------------
     # Example: dot-product with extra sinusoidal modulation
-    def user_score_fn_block(q_block, k_block, ctx):
+
+
+    def user_score_fn_block(q, k):
         """
         q_block: (Q, C)
         k_block: (K, C)
-        return: scores (Q, K)
+        ctx: {"scale": float, "alpha": float}
+
+        returns:
+            scores: (Q, K)
         """
-        # Example fused nonlinear score
-        diff_sum = (q_block[:,None,:] - k_block[None,:,:]).sum(-1)   # (Q,K)
-        scores = q_block @ k_block.T                                 # (Q,K)
-        return scores * ctx["scale"] + ctx["alpha"] * diff_sum
+
+        s = jax.lax.dot_general(
+            q, k, dimension_numbers, preferred_element_type=jnp.float32
+        )  # [block_q, block_k]
+
+        # custom kernel with pallas
+        q_sum = jnp.sum(q, axis=-1)  # Shape: (Q_block,)
+        k_sum = jnp.sum(k, axis=-1)  # Shape: (K_block,)
+        
+        # Broadcast subtraction to get (Q, K) shape
+        diff_sum = q_sum[:, None] - k_sum[None, :]
+
+        s += diff_sum
+        return s
+    
+    user_score_fn_block_jit = jax.jit(user_score_fn_block)
 
 
-    # User context (can be ANY PyTree)
-    score_ctx = {
-        "scale": sm_scale,
-        "alpha": 0.3,
-    }
 
     results = benchmark.run_bench_suite(
         q, k, v,
@@ -59,8 +78,8 @@ def main():
         block_k_major=128,
         block_k=128,
         causal=False,
-        score_fn=None,
-        score_ctx=None
+        score_fn=user_score_fn_block_jit,
+        which=["flash","flash_ref"]
     )
     print("\nSummary:", results)
 

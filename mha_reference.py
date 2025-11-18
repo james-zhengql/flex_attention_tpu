@@ -11,11 +11,10 @@ def mha_reference(
     sm_scale: float = 1.0,
     save_residuals: bool = False,
     score_fn=None,
-    score_ctx=None,
 ):
     """
     Reference multi-head attention for correctness checking.
-    Supports optional custom score_fn(q_vec, k_vec, score_ctx).
+    Supports optional custom score_fn(q_vec).
     """
 
     batch, heads, q_len, dim = q.shape
@@ -28,16 +27,18 @@ def mha_reference(
     else:
         # score_fn wants (Q,C) and (K,C), not full BHQC tensors
         def apply_block(q_bh, k_bh):
-            return score_fn(q_bh, k_bh, score_ctx)   # (Q,K)
+            return score_fn(q_bh, k_bh)
+
 
         # vmap over batch and heads:
-        logits = jax.vmap(          # batch
-                    jax.vmap(       # head
-                        apply_block,
-                        in_axes=(0, 0), out_axes=0
-                    ),
-                    in_axes=(0, 0), out_axes=0
-                )(q, k)              # result: (B,H,Q,K)
+        logits = jax.vmap(
+            jax.vmap(
+                lambda q_i, k_i: score_fn(q_i, k_i),
+                in_axes=(0,0),   # q_i: (Q,C), k_i: (K,C)
+            ),
+            in_axes=(0,0)
+        )(q, k)
+
 
         if ab is not None:
             logits += ab

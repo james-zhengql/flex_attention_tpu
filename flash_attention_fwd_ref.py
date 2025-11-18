@@ -75,7 +75,7 @@ def _flash_attention_kernel_single_batch(
       # Broadcast subtraction to get (Q, K) shape
       diff_sum = q_sum[:, None] - k_sum[None, :]
 
-      S += diff_sum
+      s += diff_sum
       
       # Add attention bias if needed.
       # TODO(tanburn) Should the attention bias be added before or after

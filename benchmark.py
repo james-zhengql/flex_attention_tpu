@@ -3,14 +3,13 @@ import jax
 
 import jax.numpy as jnp
 import numpy as np
+import statistics as stats
 
 import flash_attention_fwd_ref
 import flex_attention_kernel
-import mha_reference
+from mha_reference import mha_reference
 
 import time
-import stats
-
 
 
 
@@ -74,55 +73,122 @@ def build_fns_for_bench(
     block_k_major=128,
     block_k=128,
     debug=False,
-    score_fn=None,       
-    score_ctx=None,      
+    score_fn=None,
+    which=("ref", "flash", "flash_ref"),
 ):
-    # JIT-compile reference implementation
-    ref_fn = functools.partial(mha_reference, ab=None, sm_scale=sm_scale, save_residuals=False,score_fn=score_fn,
-        score_ctx=score_ctx)
-    ref_jit = jax.jit(ref_fn)
+    """
+    Build only the functions requested in `which`.
+    which: tuple/list containing any of:
+        "ref"        – jax naive reference
+        "flash"      – your Pallas FlashAttention kernel
+        "flash_ref"  – the reference FA kernel
+    """
+    out = {}
 
-    # JIT-compile your custom Pallas kernel implementation
-    flash_partial = functools.partial(
-        flex_attention_kernel._flash_attention_impl,
-        ab=ab,
-        segment_ids=None,
-        save_residuals=save_residuals,
-        causal=causal,
+    if "ref" in which:
+        ref_partial = functools.partial(
+            mha_reference,
+            ab=None,
+            sm_scale=sm_scale,
+            save_residuals=False,
+            score_fn=score_fn,
+        )
+        out["ref_jit"] = jax.jit(ref_partial, static_argnames=("score_fn",))
+
+    if "flash" in which:
+        flash_partial = functools.partial(
+            flex_attention_kernel._flash_attention_impl,
+            ab=ab,
+            segment_ids=None,
+            save_residuals=save_residuals,
+            causal=causal,
+            sm_scale=sm_scale,
+            block_b=block_b,
+            block_q=block_q,
+            block_k_major=block_k_major,
+            block_k=block_k,
+            debug=debug,
+            score_fn=score_fn,
+        )
+        out["flash_jit"] = jax.jit(flash_partial, static_argnames=("score_fn",))
+
+    if "flash_ref" in which:
+        flash_ref_partial = functools.partial(
+            flash_attention_fwd_ref._flash_attention_impl_ref,
+            ab=ab,
+            segment_ids=None,
+            save_residuals=save_residuals,
+            causal=causal,
+            sm_scale=sm_scale,
+            block_b=block_b,
+            block_q=block_q,
+            block_k_major=block_k_major,
+            block_k=block_k,
+            debug=debug,
+        )
+        out["flash_ref_jit"] = jax.jit(flash_ref_partial)
+
+    return out
+
+
+
+def run_bench_suite(
+    q, k, v,
+    *,
+    sm_scale,
+    block_b,
+    block_q,
+    block_k_major,
+    block_k,
+    causal=False,
+    score_fn=None,
+    which=("ref", "flash", "flash_ref")
+):
+    """
+    Run benchmarks only for selected implementations.
+    """
+    b, h, q_len, d = q.shape
+    _, _, k_len, _ = k.shape
+
+    gflops = flop_count_attention(b, h, q_len, k_len, d) / 1e9
+
+    compiled = build_fns_for_bench(
+        q, k, v,
         sm_scale=sm_scale,
+        causal=causal,
         block_b=block_b,
         block_q=block_q,
         block_k_major=block_k_major,
         block_k=block_k,
-        debug=debug,
         score_fn=score_fn,
-        score_ctx=score_ctx,
+        which=which,
     )
 
-    flash_jit = jax.jit(flash_partial)
+    print(f"\n== Benchmark config: b={b}, h={h}, q={q_len}, k={k_len}, d={d}, causal={causal} ==")
+    print(f"Estimated FLOPs per call: {gflops:.2f} GFLOPs\n")
 
-    flash_ref_partial = functools.partial(
-        flash_attention_fwd_ref._flash_attention_impl_ref,
-        ab=ab,
-        segment_ids=None,
-        save_residuals=save_residuals,
-        causal=causal,
-        sm_scale=sm_scale,
-        block_b=block_b,
-        block_q=block_q,
-        block_k_major=block_k_major,
-        block_k=block_k,
-        debug=debug,
-        score_fn=score_fn,
-        score_ctx=score_ctx,
-    )
+    results = {}
 
+    if "ref_jit" in compiled:
+        fn = compiled["ref_jit"]
+        t_mean, t_med = benchmark(fn, (q, k, v), name="mha_reference[jit]")
+        print(f"  → Throughput: {gflops/t_med:.2f} GFLOP/s")
+        results["ref"] = (t_mean, t_med)
 
-    flash_ref_jit = jax.jit(flash_ref_partial)
+    if "flash_jit" in compiled:
+        fn = compiled["flash_jit"]
+        t_mean, t_med = benchmark(fn, (q, k, v), name="pallas_flash[jit]")
+        print(f"  → Throughput: {gflops/t_med:.2f} GFLOP/s")
+        results["flash"] = (t_mean, t_med)
 
-    return ref_jit, flash_jit, flash_ref_jit
+    if "flash_ref_jit" in compiled:
+        fn = compiled["flash_ref_jit"]
+        t_mean, t_med = benchmark(fn, (q, k, v), name="pallas_flash_ref[jit]")
+        print(f"  → Throughput: {gflops/t_med:.2f} GFLOP/s")
+        results["flash_ref"] = (t_mean, t_med)
 
-def run_bench_suite(q, k, v, *, sm_scale, block_b, block_q, block_k_major, block_k, causal=False,score_fn=None,score_ctx=None):
+    return results
+
     # Unpack shapes
     b, h, q_len, d = q.shape
     _, _, k_len, _ = k.shape
@@ -141,8 +207,7 @@ def run_bench_suite(q, k, v, *, sm_scale, block_b, block_q, block_k_major, block
         block_k_major=block_k_major,
         block_k=block_k,
         debug=False,
-        score_fn=score_fn,
-        score_ctx=score_ctx
+        score_fn=score_fn
     )
 
     print(f"\n== Benchmark config: b={b}, h={h}, q={q_len}, k={k_len}, d={d}, causal={causal} ==")
