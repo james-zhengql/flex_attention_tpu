@@ -6,11 +6,10 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from constants import dimension_numbers,MIN_BLOCK_SIZE
 
 
 
-dimension_numbers = (((1,), (1,)), ((), ()))
-MIN_BLOCK_SIZE = 128
 
 def lift_scalar_score_fn_to_block(user_score_fn):
     """Lift scalar fn(q_vec, k_vec, ctx)->scalar into block fn returning (Q,K)."""
@@ -233,30 +232,17 @@ def make_flash_attention_kernel(mask_fn=None,score_fn=None, score_ctx=None):
         k_ref = k_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
         q_ref = q_tile_ref[batch_idx]
 
-        # if score_fn is None:
-        #   # Default: scaled dot product
-        #   S = jax.lax.dot_general(
-        #       q_ref, k_ref,
-        #       dimension_numbers,
-        #       preferred_element_type=jnp.float32,
-        #   )
-        #   S *= sm_scale
-        # else:
-        #   # User-defined score
-        #   S = score_fn(q_ref, k_ref, score_ctx)   
-
-        def user_score_fn_block(q_block, k_block):
-          """
-          q_block: (Q, C)
-          k_block: (K, C)
-          return: scores (Q, K)
-          """
-          # Example fused nonlinear score
-          diff_sum = (q_block[:,None,:] - k_block[None,:,:]).sum(-1)   # (Q,K)
-          scores = q_block @ k_block.T                                 # (Q,K)
-          return scores * 0.3 + 3 * diff_sum
-
-        S = user_score_fn_block(q_ref, k_ref)   
+        if score_fn is None:
+          # Default: scaled dot product
+          S = jax.lax.dot_general(
+              q_ref, k_ref,
+              dimension_numbers,
+              preferred_element_type=jnp.float32,
+          )
+          S *= sm_scale
+        else:
+          # User-defined score
+          S = score_fn(q_ref, k_ref, score_ctx)   
 
         if ab_tile_ref is not None:
           ab = ab_tile_ref[

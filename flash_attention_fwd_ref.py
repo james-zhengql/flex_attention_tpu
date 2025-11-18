@@ -6,6 +6,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 import jax.numpy as jnp
 
+from constants import dimension_numbers,MIN_BLOCK_SIZE
+
 def _flash_attention_kernel_ref(q_tile_ref, *args, **kwargs):
   block_b = q_tile_ref.shape[0]
   # If we're not going to tile the softmax, then we can avoid a bunch of VPU ops.
@@ -66,6 +68,15 @@ def _flash_attention_kernel_single_batch(
           q, k, dimension_numbers, preferred_element_type=jnp.float32
       )  # [block_q, block_k]
 
+      # custom kernel with pallas
+      q_sum = jnp.sum(q, axis=-1)  # Shape: (Q_block,)
+      k_sum = jnp.sum(k, axis=-1)  # Shape: (K_block,)
+    
+      # Broadcast subtraction to get (Q, K) shape
+      diff_sum = q_sum[:, None] - k_sum[None, :]
+
+      S += diff_sum
+      
       # Add attention bias if needed.
       # TODO(tanburn) Should the attention bias be added before or after
       # multiplication by sm_scale?
