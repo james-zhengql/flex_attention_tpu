@@ -130,6 +130,47 @@ def build_fns_for_bench(
 
     return out
 
+def compute_diff(ref_out, test_out):
+    """Compute numeric diff between ref outputs and test outputs.
+    
+    Works for:
+      - single tensors
+      - tuples/lists of tensors
+    Returns:
+      dict mapping field index → relative L2 error
+    """
+    diffs = {}
+
+    # Normalize everything into tuples
+    if not isinstance(ref_out, (tuple, list)):
+        ref_out = (ref_out,)
+    if not isinstance(test_out, (tuple, list)):
+        test_out = (test_out,)
+
+    # Check matching length
+    if len(ref_out) != len(test_out):
+        raise ValueError(
+            f"Output count mismatch: ref has {len(ref_out)}, test has {len(test_out)}"
+        )
+
+    # Compute L2 diff for each component
+    for i, (r, t) in enumerate(zip(ref_out, test_out)):
+        if r is None and t is None:
+            diffs[i] = None
+            continue
+        if r is None or t is None:
+            raise ValueError(f"Mismatch: ref[{i}] is {r}, test[{i}] is {t}")
+
+        # Ensure shapes match
+        if r.shape != t.shape:
+            raise ValueError(
+                f"Shape mismatch at output {i}: ref {r.shape} vs test {t.shape}"
+            )
+
+        diff = jnp.linalg.norm(t - r) / (jnp.linalg.norm(r) + 1e-6)
+        diffs[i] = float(diff)
+
+    return diffs
 
 
 def run_bench_suite(
@@ -187,62 +228,20 @@ def run_bench_suite(
         print(f"  → Throughput: {gflops/t_med:.2f} GFLOP/s")
         results["flash_ref"] = (t_mean, t_med)
 
+        # ---- Numeric diff ONLY IF multiple outputs ----
+    if "flash_ref_jit" in compiled and "flash_jit" in compiled:
+        ref_out = compiled["flash_ref_jit"](q, k, v)
+        flash_out = compiled["flash_jit"](q, k, v)
+
+        # Normalize to list/tuple
+        ref_list = ref_out if isinstance(ref_out, (tuple, list)) else (ref_out,)
+        flash_list = flash_out if isinstance(flash_out, (tuple, list)) else (flash_out,)
+
+        # run diff always
+        diffs = compute_diff(ref_list, flash_list)
+        print("\nNumeric diff:")
+        for i, e in diffs.items():
+            print(f"  output[{i}] rel L2 error = {e}")
+
+
     return results
-
-    # Unpack shapes
-    b, h, q_len, d = q.shape
-    _, _, k_len, _ = k.shape
-
-    # Compute FLOPs (for throughput calculation)
-    gflops = flop_count_attention(b, h, q_len, k_len, d) / 1e9
-
-    # Create JIT-compiled versions of both implementations
-    ref_jit, flash_jit, flash_ref_jit = build_fns_for_bench(
-        q, k, v,
-        sm_scale=sm_scale,
-        save_residuals=False,  # exclude residual buffers for fair comparison
-        causal=causal,
-        block_b=block_b,
-        block_q=block_q,
-        block_k_major=block_k_major,
-        block_k=block_k,
-        debug=False,
-        score_fn=score_fn
-    )
-
-    print(f"\n== Benchmark config: b={b}, h={h}, q={q_len}, k={k_len}, d={d}, causal={causal} ==")
-    print(f"Estimated FLOPs per call: {gflops:.2f} GFLOPs")
-
-    # ---- Reference (naive) implementation ----
-    t_mean_ref, t_med_ref = benchmark(ref_jit, (q, k, v), name="mha_reference[jit]")
-    print(f"  → Throughput: {gflops / t_med_ref:.2f} GFLOP/s")
-
-    # ---- Pallas FlashAttention kernel ----
-    t_mean_flash, t_med_flash = benchmark(flash_jit, (q, k, v), name="pallas_flash[jit]")
-    print(f"  → Throughput: {gflops / t_med_flash:.2f} GFLOP/s")
-
-    # ---- Pallas FlashAttention kernel ----
-    t_mean_flash_ref, t_med_flash_ref = benchmark(flash_ref_jit, (q, k, v), name="pallas_flash_ref[jit]")
-    print(f"  → Throughput: {gflops / t_med_flash:.2f} GFLOP/s")
-
-    # ---- Numeric correctness check ----
-    o_ref = ref_jit(q, k, v).block_until_ready()
-    o_flash = flash_jit(q, k, v)
-    if isinstance(o_flash, (tuple, list)):
-        o_flash = o_flash[0]
-    o_flash = o_flash.block_until_ready()
-
-    # Relative L2 error measures numerical difference between both results
-    rel_err = jnp.linalg.norm(o_flash - o_ref) / jnp.linalg.norm(o_ref)
-    print(f"Numeric diff (Relative L2): {rel_err:.3e}")
-
-    # Return summarized metrics
-    return {
-        "ref_ms_med": t_med_ref * 1e3,
-        "flash_ms_med": t_med_flash * 1e3,
-        "flash_ref_ms_med":t_med_flash_ref*1e3,
-        "ref_gflops": gflops / t_med_ref,
-        "flash_gflops": gflops / t_med_flash,
-        "flash_ref_gflops": gflops / t_med_flash_ref,
-        "rel_l2": float(rel_err),
-    }

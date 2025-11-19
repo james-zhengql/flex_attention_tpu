@@ -10,29 +10,7 @@ from constants import dimension_numbers,MIN_BLOCK_SIZE
 
 
 
-
-def lift_scalar_score_fn_to_block(user_score_fn):
-    """Lift scalar fn(q_vec, k_vec, ctx)->scalar into block fn returning (Q,K)."""
-
-    def block_score_fn(q_block, k_block, ctx):
-        # q_block: (Q, C)
-        # k_block: (K, C)
-
-        # vmaps:
-        # score_one(q_vec, k_vec) -> scalar
-        def score_one(qv, kv):
-            return user_score_fn(qv, kv, ctx)
-
-        # K dimension (for a fixed q): (K,)
-        score_over_k = jax.vmap(score_one, in_axes=(None, 0))
-
-        # Q dimension (each q gets its own K scores): (Q,K)
-        return jax.vmap(lambda qv: score_over_k(qv, k_block))(q_block)
-
-    return block_score_fn
-
-
-def _flash_attention_kernel(q_tile_ref, *args, score_fn=None,
+def _flash_attention_kernel(q_tile_ref, *args, score_jaxpr=None,
     **kwargs):
     """Connects _flash_attention_impl to the generated kernel."""
     block_b = q_tile_ref.shape[0]
@@ -40,7 +18,7 @@ def _flash_attention_kernel(q_tile_ref, *args, score_fn=None,
     # Create the real kernel from the factory
     # ---------------------------------------------
     kernel = make_flash_attention_kernel(
-        score_fn=score_fn,
+        score_jaxpr=score_jaxpr,
     )
 
     for batch_idx in range(block_b):
@@ -98,15 +76,15 @@ def _flash_attention_impl(
   def lm_index_map(batch_index, head_index, q_seq_index, _):
     return (batch_index, head_index, q_seq_index, 0)
 
-  # if score_fn is not None:
-  #     # User provided scalar score_fn → lift to block fn
-  #     # detect scalar signature: (C),(C)->scalar
-  #     if getattr(score_fn, "_is_scalar_fn", False):
-  #         score_fn = lift_scalar_score_fn_to_block(score_fn)
-  #         print("lifting it user provided scalar function")
-  # else:
-  #     score_fn = None
-  # s = jax.jit(score_fn)
+  if score_fn is not None:
+      score_jaxpr = jax.make_jaxpr(score_fn)(
+          jnp.zeros((block_q, head_dim), q.dtype),
+          jnp.zeros((block_k, head_dim), k.dtype),
+      )
+      # print(score_jaxpr.jaxpr)
+  else:
+      score_jaxpr = None
+
 
   kernel = functools.partial(
       _flash_attention_kernel,
@@ -114,7 +92,7 @@ def _flash_attention_impl(
       sm_scale = sm_scale,
       block_k = block_k,
       kv_seq_len = kv_seq_len,
-      score_fn = score_fn,
+      score_jaxpr = score_jaxpr,
   )
 
   out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
@@ -182,7 +160,7 @@ def _flash_attention_impl(
     return o
 
 
-def make_flash_attention_kernel(mask_fn=None,score_fn=None):
+def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
   """Factory returning a kernel with an optional custom mask function."""
   def flash_attention_fwd_kernel(
       batch_idx,
@@ -229,17 +207,39 @@ def make_flash_attention_kernel(mask_fn=None,score_fn=None):
         k_ref = k_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
         q_ref = q_tile_ref[batch_idx]
 
-        if score_fn is None:
-          # Default: scaled dot product
-          S = jax.lax.dot_general(
-              q_ref, k_ref,
-              dimension_numbers,
-              preferred_element_type=jnp.float32,
-          )
-          S *= sm_scale
+        def _inline_jaxpr_score(q, k, jaxpr):
+          env = {jaxpr.invars[0]: q, jaxpr.invars[1]: k}
+
+          for eqn in jaxpr.eqns:
+              prim = eqn.primitive
+              params = eqn.params
+              inputs = [env[v] for v in eqn.invars]
+
+              out = prim.bind(*inputs, **params)
+
+              # ALWAYS convert outputs to JAX arrays
+              def to_array(x):
+                  return x if isinstance(x, jax.Array) else jnp.asarray(x)
+
+              if len(eqn.outvars) == 1:
+                  env[eqn.outvars[0]] = to_array(out)
+              else:
+                  for var, val in zip(eqn.outvars, out):
+                      env[var] = to_array(val)
+
+          return env[jaxpr.outvars[0]]
+
+
+
+        if score_jaxpr is None:
+            S = jax.lax.dot_general(q_ref, k_ref, dimension_numbers,
+                                    preferred_element_type=jnp.float32)
+            S = S * sm_scale
         else:
-          # User-defined score
-          S = score_fn(q_ref, k_ref)   
+            # 1. Check inputs for the default path
+            S = _inline_jaxpr_score(q_ref, k_ref, score_jaxpr)
+            S = jnp.squeeze(S,axis=0)
+
 
         if ab_tile_ref is not None:
           ab = ab_tile_ref[

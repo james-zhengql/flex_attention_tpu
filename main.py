@@ -68,11 +68,15 @@ def main():
     #     return s
 
     def my_score(q, k):
-        return (q * k).sum(-1) + 0.3 * jnp.tanh(jnp.dot(q, k))
+        q_sum = jnp.sum(q, axis=-1)  # Shape: (Q_block,)
+        k_sum = jnp.sum(k, axis=-1)  # Shape: (K_block,)
+        
+        # Broadcast subtraction to get (Q, K) shape
+        diff_sum = q_sum[:, None] - k_sum[None, :]
+        return jnp.dot(q, k) + 0.3 * jnp.tanh(diff_sum)
 
 
     jax_score = make_jax_score_fn(my_score)
-
 
     results = benchmark.run_bench_suite(
         q, k, v,
