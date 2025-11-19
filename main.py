@@ -6,6 +6,7 @@ import benchmark
 
 from typing import NamedTuple
 from constants import dimension_numbers
+from util import make_jax_score_fn
 
 class ScoreContext(NamedTuple):
     scale: jnp.ndarray
@@ -42,32 +43,35 @@ def main():
     # Example: dot-product with extra sinusoidal modulation
 
 
-    def user_score_fn_block(q, k):
-        """
-        q_block: (Q, C)
-        k_block: (K, C)
-        ctx: {"scale": float, "alpha": float}
+    # def user_score_fn_block(q, k):
+    #     """
+    #     q_block: (Q, C)
+    #     k_block: (K, C)
+    #     ctx: {"scale": float, "alpha": float}
 
-        returns:
-            scores: (Q, K)
-        """
+    #     returns:
+    #         scores: (Q, K)
+    #     """
 
-        s = jax.lax.dot_general(
-            q, k, dimension_numbers, preferred_element_type=jnp.float32
-        )  # [block_q, block_k]
+    #     s = jax.lax.dot_general(
+    #         q, k, dimension_numbers, preferred_element_type=jnp.float32
+    #     )  # [block_q, block_k]
 
-        # custom kernel with pallas
-        q_sum = jnp.sum(q, axis=-1)  # Shape: (Q_block,)
-        k_sum = jnp.sum(k, axis=-1)  # Shape: (K_block,)
+    #     # custom kernel with pallas
+    #     q_sum = jnp.sum(q, axis=-1)  # Shape: (Q_block,)
+    #     k_sum = jnp.sum(k, axis=-1)  # Shape: (K_block,)
         
-        # Broadcast subtraction to get (Q, K) shape
-        diff_sum = q_sum[:, None] - k_sum[None, :]
+    #     # Broadcast subtraction to get (Q, K) shape
+    #     diff_sum = q_sum[:, None] - k_sum[None, :]
 
-        s += diff_sum
-        return s
-    
-    user_score_fn_block_jit = jax.jit(user_score_fn_block)
+    #     s += diff_sum
+    #     return s
 
+    def my_score(q, k):
+        return (q * k).sum(-1) + 0.3 * jnp.tanh(jnp.dot(q, k))
+
+
+    jax_score = make_jax_score_fn(my_score)
 
 
     results = benchmark.run_bench_suite(
@@ -78,7 +82,7 @@ def main():
         block_k_major=128,
         block_k=128,
         causal=False,
-        score_fn=user_score_fn_block_jit,
+        score_fn=jax_score,
         which=["flash","flash_ref"]
     )
     print("\nSummary:", results)

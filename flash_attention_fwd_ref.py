@@ -68,14 +68,11 @@ def _flash_attention_kernel_single_batch(
           q, k, dimension_numbers, preferred_element_type=jnp.float32
       )  # [block_q, block_k]
 
-      # custom kernel with pallas
-      q_sum = jnp.sum(q, axis=-1)  # Shape: (Q_block,)
-      k_sum = jnp.sum(k, axis=-1)  # Shape: (K_block,)
-    
-      # Broadcast subtraction to get (Q, K) shape
-      diff_sum = q_sum[:, None] - k_sum[None, :]
+      # Reuse the dot product "s" instead of recomputing
+      nonlinear_term = 0.3 * jnp.tanh(s)
 
-      s += diff_sum
+      s = s + nonlinear_term
+
       
       # Add attention bias if needed.
       # TODO(tanburn) Should the attention bias be added before or after
