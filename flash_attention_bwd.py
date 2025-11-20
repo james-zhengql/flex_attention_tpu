@@ -5,6 +5,7 @@ from typing import Callable
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax import lax
 
 import jax.numpy as jnp
 import numpy as np
@@ -12,32 +13,270 @@ import numpy as np
 dimension_numbers = (((1,), (1,)), ((), ()))
 MIN_BLOCK_SIZE = 128
 
-def _flash_attention_bwd(q_tile_ref, *args, **kwargs):
+###########################
+# TPU-SAFE BWD RULES
+###########################
 
-    block_b = q_tile_ref.shape[0]
+def _bwd_add(inputs, out, d_out, params):
+    x, y = inputs
+    return d_out, d_out
 
-    # Create the real kernel from the factory
-    kernel = flash_attention_bwd_kernel
+def _bwd_mul(inputs, out, d_out, params):
+    x, y = inputs
+    return d_out * y, d_out * x
 
-    for batch_idx in range(block_b):
-        kernel(
-            (batch_idx, 0),
-            q_tile_ref,
-            *args,
-            **kwargs,
-        )
+def _bwd_sub(inputs, out, d_out, params):
+    x, y = inputs
+    return d_out, -d_out
 
-def flash_attention_bwd(
+def _bwd_div(inputs, out, d_out, params):
+    x, y = inputs
+    return d_out / y, -d_out * x / (y * y)
+
+def _bwd_tanh(inputs, out, d_out, params):
+    return d_out * (1 - out * out),
+
+def _bwd_reduce_sum(inputs, out, d_out, params):
+    (x,) = inputs
+    # expand upstream gradient to input shape
+    return jnp.broadcast_to(d_out, x.shape),
+
+def _bwd_dot_general(inputs, out, d_out, params):
+    lhs, rhs = inputs
+    # derivative of <lhs @ rhs> w.r.t lhs: d_out @ rhs.T
+    # derivative w.r.t rhs: lhs.T @ d_out
+    dim_nums = params["dimension_numbers"]
+    return (
+        lax.dot_general(d_out, rhs, dim_nums, preferred_element_type=jnp.float32),
+        lax.dot_general(lhs, d_out, dim_nums, preferred_element_type=jnp.float32),
+    )
+
+_PRIMITIVE_BWD_TABLE = {
+    lax.add_p: _bwd_add,
+    lax.mul_p: _bwd_mul,
+    lax.sub_p: _bwd_sub,
+    lax.div_p: _bwd_div,
+    lax.tanh_p: _bwd_tanh,
+    lax.reduce_sum_p: _bwd_reduce_sum,
+    lax.dot_general_p: _bwd_dot_general,
+}
+
+#############################################################
+# INLINE SCORE BACKWARD (TPU SAFE)
+#############################################################
+
+def _inline_jaxpr_score_backward(q, k, jaxpr, d_logits):
+    """
+    Compute dq, dk given upstream gradient d_logits.
+
+    q: (Q, d)
+    k: (K, d)
+    d_logits: (Q, K)
+    """
+    # ---- Forward pass ----
+    env = {jaxpr.invars[0]: q, jaxpr.invars[1]: k}
+    tape = []
+
+    for eqn in jaxpr.eqns:
+        prim = eqn.primitive
+        bwd_rule = _PRIMITIVE_BWD_TABLE.get(prim, None)
+        if bwd_rule is None:
+            raise NotImplementedError(
+                f"Backward rule for primitive {prim} not implemented"
+            )
+
+        params = eqn.params
+        inputs = [env[v] for v in eqn.invars]
+        out = prim.bind(*inputs, **params)
+
+        # Normalize output to tuple
+        if not isinstance(out, tuple):
+            out_t = (out,)
+        else:
+            out_t = out
+
+        # bind forward outputs
+        if len(eqn.outvars) == 1:
+            env[eqn.outvars[0]] = out_t[0]
+        else:
+            for var, val in zip(eqn.outvars, out_t):
+                env[var] = val
+
+        # record
+        tape.append((eqn, inputs, out_t))
+
+    # ---- Backward pass ----
+    # seed gradient
+    dout_env = {jaxpr.outvars[0]: d_logits}
+
+    dq = jnp.zeros_like(q)
+    dk = jnp.zeros_like(k)
+
+    for eqn, inputs, out_t in reversed(tape):
+        prim = eqn.primitive
+        bwd_rule = _PRIMITIVE_BWD_TABLE[prim]
+        params = eqn.params
+
+        # gather upstream grad for each output
+        dout = []
+        for ov in eqn.outvars:
+            dout.append(dout_env.get(ov, jnp.zeros_like(env[ov])))
+        # collapse to tuple if single
+        if len(dout) == 1: dout = dout[0]
+
+        # compute local gradient
+        grads = bwd_rule(inputs, out_t[0] if len(out_t)==1 else out_t, dout, params)
+
+        # always tuple
+        if not isinstance(grads, tuple):
+            grads = (grads,)
+
+        # accumulate into upstream grads
+        for var, g in zip(eqn.invars, grads):
+            if var == jaxpr.invars[0]:
+                dq += g
+            elif var == jaxpr.invars[1]:
+                dk += g
+            else:
+                if var in dout_env:
+                    dout_env[var] = dout_env[var] + g
+                else:
+                    dout_env[var] = g
+
+    return dq, dk
+
+
+def _flash_attention_dq_kernel(
+    q_tile_ref,
+    k_tile_ref,
+    v_tile_ref,
+    ab_tile_ref,
+    l_tile_ref,
+    m_tile_ref,
+    do_tile_ref,
+    di_tile_ref,
+    dq_tile_ref,
+    ds_tile_ref,
+    dq_scratch_ref,
+    *,
+    sm_scale: float,
+    causal: bool,
+    mask_value: float,
+    kv_seq_len: int,
+    block_k: int,
+    score_jaxpr = None
+):
+  _, _, block_k_major, _ = k_tile_ref.shape
+  _, _, block_q_major, _ = q_tile_ref.shape
+
+  kv_seq_index = pl.program_id(axis=3)
+  q_seq_index = pl.program_id(axis=2)
+
+  @pl.when(kv_seq_index == 0)
+  def start_new_sequence():
+    dq_scratch_ref[:, :] = jnp.zeros(dq_scratch_ref.shape, dq_scratch_ref.dtype)
+
+  def body(i, _):
+    k_slice = pl.ds(i * block_k, block_k)
+    q = q_tile_ref[0, 0, :, :]
+    k = k_tile_ref[0, 0, k_slice, :]  # [block_k, head_dim]
+    v = v_tile_ref[0, 0, k_slice, :]  # [block_k, head_dim]
+    l = l_tile_ref[0, 0, :, :]  # [block_q_major, 128]
+    m = m_tile_ref[0, 0, :, :]  # [block_q_major, 128]
+    do = do_tile_ref[0, 0, :, :]  # [block_q_major, head_dim]
+    di = di_tile_ref[0, 0, :].astype(jnp.float32)  # [block_q_major, 128]
+
+    capped_logits = jax.lax.dot_general(
+        q, k, dimension_numbers, preferred_element_type=jnp.float32
+    )
+
+    if ab_tile_ref is not None:
+      ab = ab_tile_ref[0, 0, :, pl.dslice(i * block_k, block_k)].astype(
+          jnp.float32
+      )
+      capped_logits += ab
+
+    if sm_scale != 1.0:
+      capped_logits *= sm_scale
+
+
+    p = jnp.exp(
+        capped_logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1)
+    )
+    p = p * pltpu.repeat(
+        1 / l, block_k // MIN_BLOCK_SIZE, axis=1
+    )  # [block_q_major, block_k]
+
+    # di: [block_q_major, 128]
+    # do: [block_q_major, head_dim]
+    # v: [block_k_major, head_dim]
+    dp = jax.lax.dot_general(
+        do,
+        v,
+        dimension_numbers,
+        preferred_element_type=jnp.float32,
+    )
+
+    ds = (dp - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1)) * p
+    if sm_scale != 1.0:
+        ds = ds * sm_scale
+    ##############################
+    # CUSTOM SCORE BACKWARD HOOK
+    ##############################
+    if score_jaxpr is not None:
+        dq_local, dk_local = _inline_jaxpr_score_backward(q, k, score_jaxpr, ds)
+
+        # accumulate per-k-block dk
+        dk_tile_slice = pl.ds(i * block_k, block_k)
+        dq_scratch_ref[:, :] += dq_local.astype(dq_scratch_ref.dtype)
+        # save dk into dv_scratch or dk_scratch depending on your code
+        # (in dq kernel we ONLY compute dq, so DK belongs in ds buffer)
+        ds_tile_ref[0, 0, :, dk_tile_slice] = dk_local.astype(ds_tile_ref.dtype)
+
+    else:
+        # default FlashAttention dq path
+        dq_scratch_ref[:, :] += lax.dot(
+            ds.astype(k.dtype),
+            k,
+            preferred_element_type=jnp.float32,
+        ).astype(dq_scratch_ref.dtype)
+
+
+#   if causal:
+#     should_run = below_or_on_diag(
+#         q_seq_index, block_q_major, kv_seq_index, block_k_major
+#     )
+#     should_not_run = lax.select(should_run, False, True)
+#   else:
+  should_run = True
+  should_not_run = False  # type: ignore
+
+  @pl.when(should_run)
+  def run():
+    lax.fori_loop(0, block_k_major // block_k, body, None, unroll=True)
+
+  @pl.when(should_not_run)
+  def zero_out_ds():
+    if ds_tile_ref is not None:
+      ds_tile_ref[...] = jnp.zeros_like(ds_tile_ref)
+
+  @pl.when(kv_seq_index == kv_seq_len // block_k_major - 1)
+  def end_of_kv_sequence():
+    dq_tile_ref[0, 0, :, :] = dq_scratch_ref[...].astype(dq_tile_ref.dtype)
+    dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
+
+
+def _flash_attention_bwd_dq(
     q,
     k,
     v,
     ab,
     segment_ids,
     l,
-    o,
+    m,
     do,
+    di,
     *,
-    block_b,
     block_q_major: int | None,
     block_k_major: int | None,
     block_k: int | None,
@@ -45,209 +284,139 @@ def flash_attention_bwd(
     causal: bool,
     mask_value: float,
     debug: bool,
+    score_fn = None
 ):
-    batch_size, head_num, q_seq_len, head_dim = q.shape
-    _, _, kv_seq_len, _ = k.shape
-    
-    # Grid specification
-    grid = (
-        pl.cdiv(batch_size, block_b),
-        head_num,
-        pl.cdiv(q_seq_len, block_q_major),
-        pl.cdiv(kv_seq_len, block_k_major),
-    )
+  batch_size, num_heads, q_seq_len, head_dim = q.shape
+  _, _, kv_seq_len, _ = k.shape
+#   _verify_block("block_q_dq", "q_seq_len", block_q_major, q_seq_len)
+#   _verify_block("block_k_major_dq", "kv_seq_len", block_k_major, kv_seq_len)
+#   _verify_block("block_k_dq", "block_k", block_k, kv_seq_len)
 
-    def qo_index_map(batch_index, head_index, q_seq_index, _):
-        return (batch_index, head_index, q_seq_index, 0)
+  # Broadcast out scalar values
+  m = jnp.broadcast_to(m[..., None], (*m.shape, MIN_BLOCK_SIZE))
+  l = jnp.broadcast_to(l[..., None], (*l.shape, MIN_BLOCK_SIZE))
+  # Preprocess contraction for bwd pass
+  di = jnp.broadcast_to(di[..., None], (*di.shape, block_k_major))
 
-    qo_spec = pl.BlockSpec((1, 1, block_q_major, head_dim), qo_index_map)
-    do_spec = qo_spec
+  grid = (
+      batch_size,
+      num_heads,
+      q_seq_len // block_q_major,
+      kv_seq_len // block_k_major,
+  )
 
-    def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
-        # if causal:
-        # # If the kv block is skipped, prefetch the next valid kv block, i.e. the
-        # # 0th one to be used for the next block_q rows.
-        #     next_kv_index = lax.select(
-        #     below_or_on_diag(
-        #         q_seq_index, block_q_major, kv_seq_index, block_k_major
-        #     ),
-        #     kv_seq_index,
-        #     0,
-        #     )
-        # else:
-        next_kv_index = kv_seq_index
-        return (batch_index, head_index, next_kv_index, 0)
-        
-    kv_spec = pl.BlockSpec((batch_size, head_num, kv_seq_len, head_dim), kv_index_map)
-    assert kv_spec.block_shape is not None
-    assert k.ndim == len(kv_spec.block_shape)
-    assert v.ndim == len(kv_spec.block_shape)
+  def qo_index_map(batch_index, head_index, q_seq_index, _):
+    return (batch_index, head_index, q_seq_index, 0)
 
-    def lm_index_map(batch_index, head_index, q_seq_index, _):
-        return (batch_index, head_index, q_seq_index, 0)
+  qo_spec = pl.BlockSpec((1, 1, block_q_major, head_dim), qo_index_map)
+  do_spec = qo_spec
 
-    lm_spec = pl.BlockSpec((1, 1, block_q_major, MIN_BLOCK_SIZE), lm_index_map)
-    assert lm_spec.block_shape is not None
-    assert l.ndim == len(lm_spec.block_shape)
+  def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
+    # if causal:
+    #   # If the kv block is skipped, prefetch the next valid kv block, i.e. the
+    #   # 0th one to be used for the next block_q rows.
+    #   next_kv_index = lax.select(
+    #       below_or_on_diag(
+    #           q_seq_index, block_q_major, kv_seq_index, block_k_major
+    #       ),
+    #       kv_seq_index,
+    #       0,
+    #   )
+    # else:
+    next_kv_index = kv_seq_index
+    return (batch_index, head_index, next_kv_index, 0)
 
-    def ab_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
-        return (batch_index, head_index, q_seq_index, kv_seq_index)
+  kv_spec = pl.BlockSpec((1, 1, block_k_major, head_dim), kv_index_map)
+  assert kv_spec.block_shape is not None
+  assert k.ndim == len(kv_spec.block_shape)
+  assert v.ndim == len(kv_spec.block_shape)
 
-    dab_spec = (
+  def lm_index_map(batch_index, head_index, q_seq_index, _):
+    return (batch_index, head_index, q_seq_index, 0)
+
+  lm_spec = pl.BlockSpec((1, 1, block_q_major, MIN_BLOCK_SIZE), lm_index_map)
+  assert lm_spec.block_shape is not None
+  assert l.ndim == len(lm_spec.block_shape)
+  assert m.ndim == len(lm_spec.block_shape)
+
+  di_spec = pl.BlockSpec((1, 1, block_q_major, MIN_BLOCK_SIZE), qo_index_map)
+  assert di_spec.block_shape is not None
+  assert di.ndim == len(di_spec.block_shape)
+
+  def ab_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
+    return (batch_index, head_index, q_seq_index, kv_seq_index)
+
+  dab_spec = (
       pl.BlockSpec((1, 1, block_q_major, block_k_major), ab_index_map)
       if ab is not None
       else None
-    )
+  )
 
-    # Allocate scratch buffers
-    if block_k != kv_seq_len:
-        dk_scratch = pltpu.VMEM((block_b, 1, block_k_major, head_dim), jnp.float32)
-        dv_scratch = pltpu.VMEM((block_b, 1, block_k_major, head_dim), jnp.float32)
-        # scratch_shapes = [dq_scratch, dk_scratch, dv_scratch]
-        scratch_shapes = [dk_scratch, dv_scratch]
-    else:
-        scratch_shapes = []
-    
-    # in_spec specify
-    in_specs = [
-      qo_spec,      # q
-      kv_spec,      # k
-      kv_spec,      # v
-      dab_spec,     # bias
-      lm_spec,      # l
-      qo_spec,      # o
-      do_spec,      # do     
-    ]
 
-    out_shapes = [
-      jax.ShapeDtypeStruct(k.shape, k.dtype),
-      jax.ShapeDtypeStruct(v.shape, v.dtype),
+  in_specs = [
+      qo_spec,
+      kv_spec,
+      kv_spec,
+      dab_spec,
+      lm_spec,
+      lm_spec,
+      do_spec,
+      di_spec,
+  ]
+
+  out_shapes = [
+      jax.ShapeDtypeStruct(q.shape, q.dtype),
       jax.ShapeDtypeStruct(ab.shape, ab.dtype) if ab is not None else None,
-    ]
-    
-    def dk_index_map(b, h, kv_tile):
-        k_start = kv_tile * block_k
-        k_end   = jnp.minimum(k_start + block_k, kv_seq_len)
-        return (
-            b,                              # batch 
-            h,                              # head 
-            jnp.arange(k_start, k_end),     # K 
-            jnp.arange(head_dim),           # D 
-    )
-    dq_spec = pl.BlockSpec((batch_size, head_num, block_q_major, head_dim), qo_index_map)
-    dk_spec = pl.BlockSpec((batch_size, head_num, block_k_major, head_dim), dk_index_map)
-    dv_spec = pl.BlockSpec((batch_size, head_num, block_k_major, head_dim), dk_index_map)
-    out_specs = [
-        dq_spec,
-        dk_spec,
-        dv_spec,
-        dab_spec,
-    ]
+  ]
+  dq_spec = pl.BlockSpec((1, 1, block_q_major, head_dim), qo_index_map)
+  out_specs = [
+      dq_spec,
+      dab_spec,
+  ]
+  scratch_shapes = [pltpu.VMEM((block_q_major, head_dim), jnp.float32)]  # type: ignore
 
-    kernel = functools.partial(
-        _flash_attention_bwd,
-        causal = causal,
-        sm_scale = sm_scale,
-        block_q = block_q_major,
-        q_seq_len = q_seq_len
-    )
+  if score_fn is not None:
+      score_jaxpr = jax.make_jaxpr(score_fn)(
+          jnp.zeros((block_q, head_dim), q.dtype),
+          jnp.zeros((block_k, head_dim), k.dtype),
+      )
+      # print(score_jaxpr.jaxpr)
+  else:
+      score_jaxpr = None
 
-    dq, dq, dv, *aux = pl.pallas_call(
-      kernel,
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=0,
-          grid=grid,
-          in_specs=in_specs,
-          out_specs=out_specs,
-          scratch_shapes=scratch_shapes,
-      ),
-      out_shape=out_shapes,
-      debug=debug,
-      compiler_params=pltpu.CompilerParams(
-          dimension_semantics=("parallel", "parallel", "parallel", "arbitrary", "parallel", "parallel", "parallel")
-      ),
-  )(q, k, v, ab, l, o, do)
+  kernel = functools.partial(
+      _flash_attention_dq_kernel,
+      sm_scale=sm_scale,
+      causal=causal,
+      mask_value=mask_value,
+      block_k=block_k,  # type: ignore
+      kv_seq_len=kv_seq_len,
+      score_jaxpr= score_jaxpr
+  )
 
+  name_scope = f"flash_mha_bwd_dq_{block_q_major=}_{block_k_major=}_{block_k=}"
+  with jax.named_scope(name_scope):
+    dq, ds = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            grid=grid,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            scratch_shapes=scratch_shapes,
+            score_jaxpr=score_jaxpr, 
+        ),
+        out_shape=out_shapes,
+        debug=debug,
+        compiler_params=pltpu.CompilerParams(
+                dimension_semantics=(
+                    "parallel",
+                    "parallel",
+                    "parallel",
+                    "arbitrary",
+                )
+        ),
+    )(q, k, v, ab, l, m, do, di)
 
-def flash_attention_bwd_kernel(
-      batch_idx,
-      q_tile_ref,
-      k_tile_ref,
-      v_tile_ref,
-      ab_tile_ref,
-      O_tile_ref,
-      dO_tile_ref,
-      dq_tile_ref,
-      dk_tile_ref,
-      dv_tile_ref,
-    #   m_tile_ref,
-      l_tile_ref,
-      dk_scratch_ref, 
-      dv_scratch_ref,
-    #   O_scratch_ref,
-    #   m_scratch_ref,
-    #   l_scratch_ref,
-      *,
-      causal,
-      sm_scale,
-      block_q,
-      q_seq_len,
-  ):
-    _, _, q_seq_length = q_tile_ref.shape
-    
-    kv_tile_idx = pl.program_id(axis = 3)
-    q_tile_idx = pl.program_id(axis = 2)
-
-    k = k_tile_ref[batch_idx]
-    v = v_tile_ref[batch_idx]
-
-    D = jnp.sum(dO_tile_ref * O_tile_ref, axis = -1)
-    block_q_repeats, rem = divmod(block_q, MIN_BLOCK_SIZE)
-    @pl.when(kv_tile_idx == 0)
-    def start_new_kv_seq():
-        # dq_scratch_ref[:, :] = jnp.zeros(dq_scratch_ref.shape, dq_scratch_ref.dtype)
-        dk_scratch_ref[batch_idx] = jnp.zeros(dk_scratch_ref[2:].shape, dk_scratch_ref.dtype)
-        dv_scratch_ref[batch_idx] = jnp.zeros(dv_scratch_ref[2:].shape, dv_scratch_ref.dtype)
-    
-    def body():
-        @pl.loop(0, q_seq_length, step=block_q, unroll=True)
-        def _body(start_q):
-            q = q_tile_ref[(*batch_idx, pl.dslice(start_q, block_q), slice(None))]
-            l = l_tile_ref[(*batch_idx, pl.dslice(start_q, block_q), slice(None))]
-            # D = D_tile_ref[(*batch_idx, pl.dslice(start_q, block_q), slice(None))]
-            # O = O_tile_ref[(*batch_idx, pl.dslice(start_q, block_q), slice(None))]
-            dO = dO_tile_ref[(*batch_idx, pl.dslice(start_q, block_q), slice(None))]
-            dq = dq_tile_ref[(*batch_idx, pl.dslice(start_q, block_q), slice(None))]
-
-            # dq_past = dq_scratch_ref[batch_idx]
-            dk_past = dk_scratch_ref[batch_idx]
-            dv_past = dv_scratch_ref[batch_idx]
-
-            S = jax.lax.dot_general(q, k, dimension_numbers, preferred_element_type=jnp.float32)
-            P = jnp.exp(S - pltpu.repeat(l, block_q_repeats, 1))
-            # dv = dv_past + jnp.einsum('rb, rd->bd', P, dO)
-            dv = dv_past + jax.lax.dot_general(P,dO,dimension_numbers,preferred_element_type=jnp.float32)
-            dv_scratch_ref[batch_idx] = dv
-
-            # dP = jnp.einsum("qc,kc->qk", dO, v)
-            dP = jax.lax.dot_general(dO,v,dimension_numbers,preferred_element_type=jnp.float32)
-            dS = P * (dP - D)
-
-            # dq = dq_past + jnp.einsum("bhqk,bhkc->bhqc", dS, k)
-            # dq = dq + jnp.einsum("bhqk,bhkc->bhqc", dS, k)
-            dq = dq + jax.lax.dot_general(dS,k,dimension_numbers,preferred_element_type=jnp.float32)
-            
-            # dk = dk_past + jnp.einsum("bhqk,bhqc->bhkc", dS, q)
-            dk = dk_past + jax.lax.dot_general(dS,q,dimension_numbers,preferred_element_type=jnp.float32)
-            dk_scratch_ref[batch_idx] = dk
-
-            dq_tile_ref[start_q] = dq.astype(dq_tile_ref.dtype)
-
-    @pl.when(q_tile_idx == (q_seq_len // block_q) - 1)
-    def store_res():
-      dk_tile_ref[batch_idx] = dk_scratch_ref[batch_idx].astype(dk_tile_ref.dtype)
-      dv_tile_ref[batch_idx] = dv_scratch_ref[batch_idx].astype(dv_tile_ref.dtype)
-            
-    # return flash_attention_bwd_kernel
-
-
+  # dab is just ds
+  return dq, ds
