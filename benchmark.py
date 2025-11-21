@@ -229,9 +229,9 @@ def run_bench_suite(
         results["flash_ref"] = (t_mean, t_med)
 
         # ---- Numeric diff ONLY IF multiple outputs ----
-    if "flash_ref_jit" in compiled and "flash_jit" in compiled:
-        ref_out = compiled["flash_ref_jit"](q, k, v)
-        flash_out = compiled["flash_jit"](q, k, v)
+    if "ref_jit" in compiled and "flash_ref_jit" in compiled:
+        ref_out = compiled["ref_jit"](q, k, v)
+        flash_out = compiled["flash_ref_jit"](q, k, v)
 
         # Normalize to list/tuple
         ref_list = ref_out if isinstance(ref_out, (tuple, list)) else (ref_out,)

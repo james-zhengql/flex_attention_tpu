@@ -6,6 +6,9 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from jax.extend import core
+from jax._src.util import safe_map
+
 from constants import dimension_numbers,MIN_BLOCK_SIZE
 
 
@@ -207,27 +210,58 @@ def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
         k_ref = k_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
         q_ref = q_tile_ref[batch_idx]
 
-        def _inline_jaxpr_score(q, k, jaxpr):
-          env = {jaxpr.invars[0]: q, jaxpr.invars[1]: k}
+        def _inline_jaxpr_score(q, k, closed_jaxpr):
+          """
+          Evaluates a ClosedJaxpr (forward-only) for score computation.
+          Args:
+              q, k: Input arrays.
+              closed_jaxpr: A jax.core.ClosedJaxpr instance.
+          """
+          jaxpr = closed_jaxpr.jaxpr
+          literals = closed_jaxpr.literals
+          
+          env = {}
 
+          def read(var):
+              # Handle literals (e.g., hardcoded numbers like 1.0 in equations)
+              if isinstance(var, core.Literal):
+                  return var.val
+              return env[var]
+
+          def write(var, val):
+              # Pallas usually prefers JAX arrays over Python scalars
+              if not hasattr(val, 'dtype'):
+                  val = jnp.asarray(val)
+              env[var] = val
+
+          # 1. Bind Arguments (Q, K) to invars
+          write(jaxpr.invars[0], q)
+          write(jaxpr.invars[1], k)
+
+          # 2. Bind Constants (Captured variables) to constvars
+          for var, val in zip(jaxpr.constvars, literals):
+              write(var, val)
+
+          # 3. Execute Equations
           for eqn in jaxpr.eqns:
-              prim = eqn.primitive
-              params = eqn.params
-              inputs = [env[v] for v in eqn.invars]
+              # Read inputs safely
+              invals = [read(v) for v in eqn.invars]
 
-              out = prim.bind(*inputs, **params)
+              # Execute Primitive
+              outvals = eqn.primitive.bind(*invals, **eqn.params)
 
-              # ALWAYS convert outputs to JAX arrays
-              def to_array(x):
-                  return x if isinstance(x, jax.Array) else jnp.asarray(x)
-
-              if len(eqn.outvars) == 1:
-                  env[eqn.outvars[0]] = to_array(out)
+              # Write outputs
+              if not eqn.outvars:
+                  continue
+              
+              if eqn.primitive.multiple_results:
+                  for var, val in zip(eqn.outvars, outvals):
+                      write(var, val)
               else:
-                  for var, val in zip(eqn.outvars, out):
-                      env[var] = to_array(val)
+                  write(eqn.outvars[0], outvals)
 
-          return env[jaxpr.outvars[0]]
+          # Return the single scalar score
+          return read(jaxpr.outvars[0])
 
 
 
@@ -238,7 +272,6 @@ def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
         else:
             # 1. Check inputs for the default path
             S = _inline_jaxpr_score(q_ref, k_ref, score_jaxpr)
-            S = jnp.squeeze(S,axis=0)
 
 
         if ab_tile_ref is not None:

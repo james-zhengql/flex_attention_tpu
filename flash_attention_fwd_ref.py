@@ -67,12 +67,14 @@ def _flash_attention_kernel_single_batch(
       s = jax.lax.dot_general(
           q, k, dimension_numbers, preferred_element_type=jnp.float32
       )  # [block_q, block_k]
-      q_sum = jnp.sum(q, axis=-1)  # Shape: (Q_block,)
-      k_sum = jnp.sum(k, axis=-1)  # Shape: (K_block,)
+      # q_sum = jnp.sum(q, axis=-1)  # Shape: (Q_block,)
+      # k_sum = jnp.sum(k, axis=-1)  # Shape: (K_block,)
 
-      diff_sum = q_sum[:, None] - k_sum[None, :]
+      # diff_sum = q_sum[:, None] - k_sum[None, :]
       # Reuse the dot product "s" instead of recomputing
-      nonlinear_term = 0.3 * jnp.tanh(diff_sum)
+      nonlinear_term = 0.3 * jnp.tanh(jax.lax.dot_general(
+          q, k, dimension_numbers, preferred_element_type=jnp.float32
+      ))
 
       s = s + nonlinear_term
 

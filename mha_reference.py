@@ -1,7 +1,10 @@
 import jax
 import jax.numpy as jnp
+from util import make_jax_score_fn
 
-
+# -------------------------------------------------------
+# 2. The Reference Implementation
+# -------------------------------------------------------
 def mha_reference(
     q,
     k,
@@ -12,60 +15,48 @@ def mha_reference(
     save_residuals: bool = False,
     score_fn=None,
 ):
-    """
-    Reference multi-head attention for correctness checking.
-    Supports optional custom score_fn(q_vec).
-    """
 
     batch, heads, q_len, dim = q.shape
-    _, _, kv_len, _ = k.shape
 
     if score_fn is None:
+        # Default Dot-Product
         logits = jnp.einsum("bhqc,bhkc->bhqk", q, k) * sm_scale
         if ab is not None:
             logits += ab
     else:
-        # score_fn wants (Q,C) and (K,C), not full BHQC tensors
-        def apply_block(q_bh, k_bh):
-            return score_fn(q_bh, k_bh)
+        # 2. Apply the Custom Score
+        #    The user function expects (Q_seq, Dim), (K_seq, Dim)
+        #    We must broadcast (vmap) it over Batch and Heads.
+        
+        # Inner vmap: Maps over Heads (axis 1)
+        # Outer vmap: Maps over Batch (axis 0)
+        batched_score = jax.vmap(
+            jax.vmap(score_fn, in_axes=(0, 0)), 
+            in_axes=(0, 0)
+        )
 
+        
+        logits = batched_score(q, k)
 
-        # vmap over batch and heads:
-        logits = jax.vmap(
-            jax.vmap(
-                lambda q_i, k_i: score_fn(q_i, k_i),
-                in_axes=(0,0),   # q_i: (Q,C), k_i: (K,C)
-            ),
-            in_axes=(0,0)
-        )(q, k)
-
-
+        # Add bias if provided (standard broadcasting handles the rest)
         if ab is not None:
             logits += ab
-
-
-
-
-    # -------------------------
-    # Causal mask (optional)
-    # -------------------------
-    mask = None
-    logits = logits if mask is None else logits + jnp.where(mask, 0.0, -1e9)
-
-    # -------------------------
-    # Numerically stable softmax
-    # -------------------------
-    m = logits.max(axis=-1)
-    unn = jnp.exp(logits - m[..., None])
-    l = unn.sum(axis=-1)
-    weights = unn / l[..., None]
+            
+        # Note: If your custom score function DOES NOT handle scale, apply it here.
+        if sm_scale != 1.0:
+            # Heuristic: Check if user function likely applied it? 
+            # For safety in reference, we often assume user handles it in custom fn,
+            # but if you want to force it:
+            # logits = logits * sm_scale
+            pass
 
     # -------------------------
-    # Weighted sum
+    # Softmax & Output
     # -------------------------
-    print("logits shape:", logits.shape)
-    print("weights shape:", weights.shape)
-    print("v shape:", v.shape)
+    m = jnp.max(logits, axis=-1, keepdims=True)
+    unn = jnp.exp(logits - m)
+    l = jnp.sum(unn, axis=-1, keepdims=True)
+    weights = unn / l
 
     out = jnp.einsum("bhqk,bhkc->bhqc", weights, v)
 
