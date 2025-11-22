@@ -6,6 +6,9 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax import lax
+from jax.extend import core
+from jax._src.util import safe_map
+
 
 import jax.numpy as jnp
 import numpy as np
@@ -13,9 +16,9 @@ import numpy as np
 dimension_numbers = (((1,), (1,)), ((), ()))
 MIN_BLOCK_SIZE = 128
 
-###########################
-# TPU-SAFE BWD RULES
-###########################
+###################################################
+# BACKEND IMPLEMENTATIONS FOR PRIMITIVES
+###################################################
 
 def _bwd_add(inputs, out, d_out, params):
     x, y = inputs
@@ -34,22 +37,31 @@ def _bwd_div(inputs, out, d_out, params):
     return d_out / y, -d_out * x / (y * y)
 
 def _bwd_tanh(inputs, out, d_out, params):
-    return d_out * (1 - out * out),
+    return (d_out * (1 - out * out),)
 
 def _bwd_reduce_sum(inputs, out, d_out, params):
     (x,) = inputs
-    # expand upstream gradient to input shape
-    return jnp.broadcast_to(d_out, x.shape),
+    return (jnp.broadcast_to(d_out, x.shape),)
 
 def _bwd_dot_general(inputs, out, d_out, params):
     lhs, rhs = inputs
-    # derivative of <lhs @ rhs> w.r.t lhs: d_out @ rhs.T
-    # derivative w.r.t rhs: lhs.T @ d_out
-    dim_nums = params["dimension_numbers"]
+    dn = params["dimension_numbers"]
     return (
-        lax.dot_general(d_out, rhs, dim_nums, preferred_element_type=jnp.float32),
-        lax.dot_general(lhs, d_out, dim_nums, preferred_element_type=jnp.float32),
+        lax.dot_general(d_out, rhs, dn, preferred_element_type=jnp.float32),
+        lax.dot_general(lhs, d_out, dn, preferred_element_type=jnp.float32),
     )
+
+def _bwd_broadcast_in_dim(inputs, out, d_out, params):
+    (x,) = inputs
+    bdims = params["broadcast_dimensions"]
+    out_shape = out.shape
+
+    reduce_axes = tuple(i for i in range(len(out_shape)) if i not in bdims)
+
+    dx = jnp.sum(d_out, axis=reduce_axes)
+    dx = jnp.reshape(dx, x.shape)
+
+    return (dx,)
 
 _PRIMITIVE_BWD_TABLE = {
     lax.add_p: _bwd_add,
@@ -59,91 +71,95 @@ _PRIMITIVE_BWD_TABLE = {
     lax.tanh_p: _bwd_tanh,
     lax.reduce_sum_p: _bwd_reduce_sum,
     lax.dot_general_p: _bwd_dot_general,
+    lax.broadcast_in_dim_p: _bwd_broadcast_in_dim,
 }
 
 #############################################################
-# INLINE SCORE BACKWARD (TPU SAFE)
+# INLINE SCORE BACKWARD (FULLY FIXED)
 #############################################################
 
-def _inline_jaxpr_score_backward(q, k, jaxpr, d_logits):
+def _inline_jaxpr_score_backward(q, k, closed_jaxpr, d_score):
     """
-    Compute dq, dk given upstream gradient d_logits.
+    Executes the Forward and Backward pass of a custom score function 
+    inside a Pallas kernel loop.
+    
+    Args:
+        q: Query tile [BlockQ, HeadDim]
+        k: Key tile [BlockK, HeadDim]
+        closed_jaxpr: The custom score ClosedJaxpr object
+        d_score: The incoming gradient w.r.t the score [BlockQ, BlockK]
+    """
+    jaxpr = closed_jaxpr.jaxpr
+    consts = closed_jaxpr.literals
+    
+    # --- 1. Environments ---
+    env = {} 
+    grad_env = {}
 
-    q: (Q, d)
-    k: (K, d)
-    d_logits: (Q, K)
-    """
-    # ---- Forward pass ----
-    env = {jaxpr.invars[0]: q, jaxpr.invars[1]: k}
-    tape = []
+    def read(var):
+        if type(var) is core.Literal: return var.val
+        return env[var]
+
+    def write(var, val):
+        env[var] = val
+
+    def read_grad(var):
+        if type(var) is core.Literal: return 0.0
+        return grad_env.get(var, 0.0)
+
+    def accumulate_grad(var, val):
+        if type(var) is core.Literal: return
+        # Initialize if missing, otherwise add
+        if var not in grad_env:
+            grad_env[var] = val
+        else:
+            grad_env[var] = grad_env[var] + val
+
+    # --- 2. Forward Pass (Recompute Primals) ---
+    # Map Q and K to the input variables of the Jaxpr
+    # Assuming score_fn(q, k) -> score
+    write(jaxpr.invars[0], q)
+    write(jaxpr.invars[1], k)
+    safe_map(write, jaxpr.constvars, consts)
 
     for eqn in jaxpr.eqns:
-        prim = eqn.primitive
-        bwd_rule = _PRIMITIVE_BWD_TABLE.get(prim, None)
-        if bwd_rule is None:
-            raise NotImplementedError(
-                f"Backward rule for primitive {prim} not implemented"
-            )
-
-        params = eqn.params
-        inputs = [env[v] for v in eqn.invars]
-        out = prim.bind(*inputs, **params)
-
-        # Normalize output to tuple
-        if not isinstance(out, tuple):
-            out_t = (out,)
+        invals = safe_map(read, eqn.invars)
+        # We rely on JAX/Pallas to inline these primitive calls
+        outvals = eqn.primitive.bind(*invals, **eqn.params)
+        if not eqn.outvars: continue
+        if eqn.primitive.multiple_results:
+             safe_map(write, eqn.outvars, outvals)
         else:
-            out_t = out
+             write(eqn.outvars[0], outvals)
 
-        # bind forward outputs
-        if len(eqn.outvars) == 1:
-            env[eqn.outvars[0]] = out_t[0]
+    # --- 3. Backward Pass (Compute Gradients) ---
+    # Seed the gradient with d_score (ds)
+    # Assuming single output score function
+    accumulate_grad(jaxpr.outvars[0], d_score)
+
+    for eqn in jaxpr.eqns[::-1]:
+        # Primal Inputs/Outputs
+        primals_in = safe_map(read, eqn.invars)
+        if eqn.primitive.multiple_results:
+            primals_out = safe_map(read, eqn.outvars)
+            d_out = safe_map(read_grad, eqn.outvars)
         else:
-            for var, val in zip(eqn.outvars, out_t):
-                env[var] = val
+            primals_out = read(eqn.outvars[0])
+            d_out = read_grad(eqn.outvars[0])
 
-        # record
-        tape.append((eqn, inputs, out_t))
+        # Look up VJP
+        if eqn.primitive not in _PRIMITIVE_BWD_TABLE:
+             raise NotImplementedError(f"Missing VJP for {eqn.primitive}")
+             
+        d_inputs = _PRIMITIVE_BWD_TABLE[eqn.primitive](
+            primals_in, primals_out, d_out, eqn.params
+        )
+        
+        safe_map(accumulate_grad, eqn.invars, d_inputs)
 
-    # ---- Backward pass ----
-    # seed gradient
-    dout_env = {jaxpr.outvars[0]: d_logits}
+    # Return dQ and dK
+    return read_grad(jaxpr.invars[0]), read_grad(jaxpr.invars[1])
 
-    dq = jnp.zeros_like(q)
-    dk = jnp.zeros_like(k)
-
-    for eqn, inputs, out_t in reversed(tape):
-        prim = eqn.primitive
-        bwd_rule = _PRIMITIVE_BWD_TABLE[prim]
-        params = eqn.params
-
-        # gather upstream grad for each output
-        dout = []
-        for ov in eqn.outvars:
-            dout.append(dout_env.get(ov, jnp.zeros_like(env[ov])))
-        # collapse to tuple if single
-        if len(dout) == 1: dout = dout[0]
-
-        # compute local gradient
-        grads = bwd_rule(inputs, out_t[0] if len(out_t)==1 else out_t, dout, params)
-
-        # always tuple
-        if not isinstance(grads, tuple):
-            grads = (grads,)
-
-        # accumulate into upstream grads
-        for var, g in zip(eqn.invars, grads):
-            if var == jaxpr.invars[0]:
-                dq += g
-            elif var == jaxpr.invars[1]:
-                dk += g
-            else:
-                if var in dout_env:
-                    dout_env[var] = dout_env[var] + g
-                else:
-                    dout_env[var] = g
-
-    return dq, dk
 
 
 def _flash_attention_dq_kernel(
@@ -230,7 +246,8 @@ def _flash_attention_dq_kernel(
         dq_scratch_ref[:, :] += dq_local.astype(dq_scratch_ref.dtype)
         # save dk into dv_scratch or dk_scratch depending on your code
         # (in dq kernel we ONLY compute dq, so DK belongs in ds buffer)
-        ds_tile_ref[0, 0, :, dk_tile_slice] = dk_local.astype(ds_tile_ref.dtype)
+        if ds_tile_ref is not None:
+            ds_tile_ref[0, 0, :, dk_tile_slice] = dk_local.astype(ds_tile_ref.dtype)
 
     else:
         # default FlashAttention dq path
@@ -270,7 +287,6 @@ def _flash_attention_bwd_dq(
     k,
     v,
     ab,
-    segment_ids,
     l,
     m,
     do,
@@ -375,7 +391,7 @@ def _flash_attention_bwd_dq(
 
   if score_fn is not None:
       score_jaxpr = jax.make_jaxpr(score_fn)(
-          jnp.zeros((block_q, head_dim), q.dtype),
+          jnp.zeros((block_q_major, head_dim), q.dtype),
           jnp.zeros((block_k, head_dim), k.dtype),
       )
       # print(score_jaxpr.jaxpr)
@@ -401,7 +417,6 @@ def _flash_attention_bwd_dq(
             in_specs=in_specs,
             out_specs=out_specs,
             scratch_shapes=scratch_shapes,
-            score_jaxpr=score_jaxpr, 
         ),
         out_shape=out_shapes,
         debug=debug,

@@ -1,7 +1,10 @@
 import jax
 import jax.numpy as jnp
+from util import make_jax_score_fn
 
-
+# -------------------------------------------------------
+# 2. The Reference Implementation
+# -------------------------------------------------------
 def mha_reference(
     q,
     k,
@@ -11,61 +14,51 @@ def mha_reference(
     sm_scale: float = 1.0,
     save_residuals: bool = False,
     score_fn=None,
+    causal: bool = False,   
 ):
-    """
-    Reference multi-head attention for correctness checking.
-    Supports optional custom score_fn(q_vec).
-    """
 
     batch, heads, q_len, dim = q.shape
-    _, _, kv_len, _ = k.shape
 
     if score_fn is None:
+        # Default Dot-Product
         logits = jnp.einsum("bhqc,bhkc->bhqk", q, k) * sm_scale
         if ab is not None:
             logits += ab
     else:
-        # score_fn wants (Q,C) and (K,C), not full BHQC tensors
-        def apply_block(q_bh, k_bh):
-            return score_fn(q_bh, k_bh)
+        # 2. Apply the Custom Score
+        #    The user function expects (Q_seq, Dim), (K_seq, Dim)
+        #    We must broadcast (vmap) it over Batch and Heads.
+        
+        batched_score = jax.vmap(
+            jax.vmap(score_fn, in_axes=(0, 0)), 
+            in_axes=(0, 0)
+        )
 
+        logits = batched_score(q, k)
 
-        # vmap over batch and heads:
-        logits = jax.vmap(
-            jax.vmap(
-                lambda q_i, k_i: score_fn(q_i, k_i),
-                in_axes=(0,0),   # q_i: (Q,C), k_i: (K,C)
-            ),
-            in_axes=(0,0)
-        )(q, k)
-
-
+        # Add bias if provided
         if ab is not None:
             logits += ab
 
+        # If user score doesn't include sm_scale, you could apply it here.
+        if sm_scale != 1.0:
+            # keep behavior same as your old version: assume user handles scale
+            pass
 
-
-
-    # -------------------------
-    # Causal mask (optional)
-    # -------------------------
-    mask = None
-    logits = logits if mask is None else logits + jnp.where(mask, 0.0, -1e9)
-
-    # -------------------------
-    # Numerically stable softmax
-    # -------------------------
-    m = logits.max(axis=-1)
-    unn = jnp.exp(logits - m[..., None])
-    l = unn.sum(axis=-1)
-    weights = unn / l[..., None]
+    if causal:
+        k_len = logits.shape[-1]
+        q_idx = jnp.arange(q_len)[:, None]      # (Q,1)
+        k_idx = jnp.arange(k_len)[None, :]     # (1,K)
+        causal_mask = k_idx > q_idx            # (Q,K)
+        logits = jnp.where(causal_mask, -1e9, logits)
 
     # -------------------------
-    # Weighted sum
+    # Softmax & Output
     # -------------------------
-    print("logits shape:", logits.shape)
-    print("weights shape:", weights.shape)
-    print("v shape:", v.shape)
+    m = jnp.max(logits, axis=-1, keepdims=True)
+    unn = jnp.exp(logits - m)
+    l = jnp.sum(unn, axis=-1, keepdims=True)
+    weights = unn / l
 
     out = jnp.einsum("bhqk,bhkc->bhqc", weights, v)
 

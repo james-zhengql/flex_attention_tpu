@@ -183,4 +183,4 @@ def make_jax_score_fn(user_fn):
     # 4. Return the JIT-compiled function
     # -----------------------------
     rewritten_fn = namespace[user_fn.__name__]
-    return jax.jit(rewritten_fn)
+    return rewritten_fn

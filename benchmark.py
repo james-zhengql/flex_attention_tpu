@@ -286,3 +286,4 @@ def run_bench_suite(
             results[name] = (t_mean, t_med)
 
     return results
+

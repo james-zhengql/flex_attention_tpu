@@ -6,11 +6,10 @@ from jax.experimental.pallas import tpu as pltpu
 
 import jax.numpy as jnp
 
-from constants import dimension_numbers,MIN_BLOCK_SIZE
+from constants import dimension_numbers, MIN_BLOCK_SIZE
 
 def _flash_attention_kernel_ref(q_tile_ref, *args, **kwargs):
   block_b = q_tile_ref.shape[0]
-  # If we're not going to tile the softmax, then we can avoid a bunch of VPU ops.
   kernel = _flash_attention_kernel_single_batch
   for batch_idx in range(block_b):
     kernel((batch_idx, 0), q_tile_ref, *args, **kwargs)
@@ -22,7 +21,7 @@ def _flash_attention_kernel_single_batch(
     k_tile_ref,
     v_tile_ref,
     ab_tile_ref,
-    o_tile_ref,  # Output arrays
+    o_tile_ref,  
     l_ref,
     m_ref,
     m_scratch_ref,
@@ -67,19 +66,12 @@ def _flash_attention_kernel_single_batch(
       s = jax.lax.dot_general(
           q, k, dimension_numbers, preferred_element_type=jnp.float32
       )  # [block_q, block_k]
-      q_sum = jnp.sum(q, axis=-1)  # Shape: (Q_block,)
-      k_sum = jnp.sum(k, axis=-1)  # Shape: (K_block,)
 
-      diff_sum = q_sum[:, None] - k_sum[None, :]
-      # Reuse the dot product "s" instead of recomputing
-      nonlinear_term = 0.3 * jnp.tanh(diff_sum)
-
+      nonlinear_term = 0.3 * jnp.tanh(jax.lax.dot_general(
+          q, k, dimension_numbers, preferred_element_type=jnp.float32
+      ))
       s = s + nonlinear_term
 
-      
-      # Add attention bias if needed.
-      # TODO(tanburn) Should the attention bias be added before or after
-      # multiplication by sm_scale?
       if ab_tile_ref is not None:
         ab = ab_tile_ref[
             (*batch_idx, pl.dslice(None), pl.dslice(start_k, block_k))
@@ -89,11 +81,18 @@ def _flash_attention_kernel_single_batch(
       if sm_scale != 1.0:
         s *= sm_scale
 
-      mask = None
+      if causal:
+        q_start = q_seq_idx * block_q
+        k_start = kv_seq_idx * block_k_major + start_k
 
+        q_pos = (q_start + jnp.arange(block_q))[:, None]
+        k_pos = (k_start + jnp.arange(block_k))[None, :]
 
-      m_curr = jnp.max(s, axis=1)[:, None]  # Row max, shape [block_q, 1].
-      m_next = jnp.maximum(m_prev, m_curr)  # Shape [block_q, 128].
+        causal_mask = k_pos > q_pos
+        s = jnp.where(causal_mask, -1e9, s)
+
+      m_curr = jnp.max(s, axis=1)[:, None]
+      m_next = jnp.maximum(m_prev, m_curr)
 
       block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
       if rem:
@@ -102,11 +101,10 @@ def _flash_attention_kernel_single_batch(
         )
       p = jnp.exp(s - pltpu.repeat(m_next, block_k_repeats, 1))
 
-      alpha = jnp.exp(m_prev - m_next)  # Shape [block_q, 128].
-
+      alpha = jnp.exp(m_prev - m_next)
       l_corr = alpha * l_prev
 
-      l_next = jnp.sum(p, axis=1)[:, None] + l_corr  # Shape [block_q, 128]
+      l_next = jnp.sum(p, axis=1)[:, None] + l_corr
 
       head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
       l_broadcast = lambda l: pltpu.repeat(l, head_dim_repeats, 1)
@@ -154,7 +152,6 @@ def _flash_attention_impl_ref(
   batch_size, num_heads, q_seq_len, head_dim = q.shape
   _, _, kv_seq_len, _ = k.shape
 
-  # Grid specification
   grid = (
       pl.cdiv(batch_size, block_b),
       num_heads,
@@ -192,7 +189,6 @@ def _flash_attention_impl_ref(
   out_shape = [out_shape]
   out_specs = [pl.BlockSpec((block_b, 1, block_q, head_dim), o_index_map)]
 
-  # Allocate scratch buffers
   if block_k != kv_seq_len:
     m_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
     l_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
@@ -201,7 +197,6 @@ def _flash_attention_impl_ref(
   else:
     scratch_shapes = []
 
-  # Output specs
   if save_residuals:
     out_specs = [
         *out_specs,
