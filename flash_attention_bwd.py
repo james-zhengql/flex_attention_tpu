@@ -161,7 +161,6 @@ def _flash_attention_dq_kernel(
     *,
     sm_scale: float,
     causal: bool,
-    mask_value: float,
     kv_seq_len: int,
     block_k: int,
     score_jaxpr = None
@@ -282,7 +281,6 @@ def _flash_attention_bwd_dq(
     block_k: int | None,
     sm_scale: float,
     causal: bool,
-    mask_value: float,
     debug: bool,
     score_fn = None
 ):
@@ -388,7 +386,6 @@ def _flash_attention_bwd_dq(
       _flash_attention_dq_kernel,
       sm_scale=sm_scale,
       causal=causal,
-      mask_value=mask_value,
       block_k=block_k,  # type: ignore
       kv_seq_len=kv_seq_len,
       score_jaxpr= score_jaxpr

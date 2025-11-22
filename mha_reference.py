@@ -70,3 +70,63 @@ def mha_reference(
     out = jnp.einsum("bhqk,bhkc->bhqc", weights, v)
 
     return (out, l, m) if save_residuals else out
+
+
+def mha_bwd_reference(
+    q,
+    k,
+    v,
+    o,
+    do,
+    l,
+    m,
+    ab: jax.Array | None = None,
+    *,
+    causal: bool = False,
+    mask_value: float = None,
+    sm_scale: float = 1.0,
+    save_residuals: bool = True,
+    score_fn = None
+):
+
+    if score_fn is None:
+        logits = jnp.einsum("bhqc,bhkc->bhqk", q, k)
+    else:
+        logits = score_fn(q, k)
+
+    if ab is not None:
+        logits += ab
+    if sm_scale != 1.0:
+        logits *= sm_scale
+
+    # # no causal masking
+    # mask = None
+    # logits = logits if mask is None else logits + jnp.where(mask, 0.0, -1e9)
+
+    # m = logits.max(axis=-1)
+    unnormalized = jnp.exp(logits - m[..., None])
+    # l = unnormalized.sum(axis=-1)
+    # weights = unnormalized / l[..., None]
+    # o = jnp.einsum("bhkq,bhkc->bhqc", weights, v)
+
+    p = unnormalized / l[..., None]
+
+    # dv = P^T * do
+    dv = jnp.einsum("bhqk,bhqc->bhkc", p, do)
+
+    # dp = do * V^T
+    dp = jnp.einsum("bhqc,bhkc->bhqk", do, v)
+
+    # software backward
+    sum_d = jnp.sum(do*o, axis=-1)
+    ds = p * (dp - sum_d[..., None])
+
+    if score_fn is None:
+        dq = jnp.einsum("bhqk,bhkc->bhqc", ds, k)
+        dk = jnp.einsum("bhqk,bhqc->bhkc", ds, q)
+    else:
+        _, vjp_fn = jax.vjp(score_fn, q, k)
+        dq, dk = vjp_fn(ds)
+
+
+    return dq, dk, dv
