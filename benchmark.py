@@ -27,7 +27,6 @@ def benchmark(fn, args, iters=30, warmup=5, name="fn"):
     # 1. Warmup phase — triggers JIT compilation and stabilizes cache
     for _ in range(warmup):
         y = fn(*args)
-        # .block_until_ready() ensures we wait until computation is finished
         if isinstance(y, (tuple, list)):
             jax.tree_util.tree_map(
                 lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, y
@@ -40,7 +39,6 @@ def benchmark(fn, args, iters=30, warmup=5, name="fn"):
     for _ in range(iters):
         t0 = time.perf_counter()
         y = fn(*args)
-        # Synchronize (very important for accurate timing)
         if isinstance(y, (tuple, list)):
             jax.tree_util.tree_map(
                 lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, y
@@ -58,7 +56,6 @@ def benchmark(fn, args, iters=30, warmup=5, name="fn"):
     print(f"[{name}] mean={mean_t*1e3:.2f} ms  median={med_t*1e3:.2f} ms  "
           f"p10={p10*1e3:.2f} ms  p90={p90*1e3:.2f} ms")
 
-    # Return average and median latency (seconds)
     return mean_t, med_t
 
 def build_fns_for_bench(
@@ -92,6 +89,7 @@ def build_fns_for_bench(
             sm_scale=sm_scale,
             save_residuals=False,
             score_fn=score_fn,
+            causal=causal,   
         )
         out["ref_jit"] = jax.jit(ref_partial, static_argnames=("score_fn",))
 
@@ -141,19 +139,16 @@ def compute_diff(ref_out, test_out):
     """
     diffs = {}
 
-    # Normalize everything into tuples
     if not isinstance(ref_out, (tuple, list)):
         ref_out = (ref_out,)
     if not isinstance(test_out, (tuple, list)):
         test_out = (test_out,)
 
-    # Check matching length
     if len(ref_out) != len(test_out):
         raise ValueError(
             f"Output count mismatch: ref has {len(ref_out)}, test has {len(test_out)}"
         )
 
-    # Compute L2 diff for each component
     for i, (r, t) in enumerate(zip(ref_out, test_out)):
         if r is None and t is None:
             diffs[i] = None
@@ -161,7 +156,6 @@ def compute_diff(ref_out, test_out):
         if r is None or t is None:
             raise ValueError(f"Mismatch: ref[{i}] is {r}, test[{i}] is {t}")
 
-        # Ensure shapes match
         if r.shape != t.shape:
             raise ValueError(
                 f"Shape mismatch at output {i}: ref {r.shape} vs test {t.shape}"
@@ -228,20 +222,16 @@ def run_bench_suite(
         print(f"  → Throughput: {gflops/t_med:.2f} GFLOP/s")
         results["flash_ref"] = (t_mean, t_med)
 
-        # ---- Numeric diff ONLY IF multiple outputs ----
     if "ref_jit" in compiled and "flash_ref_jit" in compiled:
         ref_out = compiled["ref_jit"](q, k, v)
         flash_out = compiled["flash_ref_jit"](q, k, v)
 
-        # Normalize to list/tuple
         ref_list = ref_out if isinstance(ref_out, (tuple, list)) else (ref_out,)
         flash_list = flash_out if isinstance(flash_out, (tuple, list)) else (flash_out,)
 
-        # run diff always
         diffs = compute_diff(ref_list, flash_list)
         print("\nNumeric diff:")
         for i, e in diffs.items():
             print(f"  output[{i}] rel L2 error = {e}")
-
 
     return results

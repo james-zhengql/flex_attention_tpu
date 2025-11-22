@@ -9,17 +9,14 @@ import jax.numpy as jnp
 from jax.extend import core
 from jax._src.util import safe_map
 
-from constants import dimension_numbers,MIN_BLOCK_SIZE
+from constants import dimension_numbers, MIN_BLOCK_SIZE
 
 
 
-def _flash_attention_kernel(q_tile_ref, *args, score_jaxpr=None,
-    **kwargs):
+def _flash_attention_kernel(q_tile_ref, *args, score_jaxpr=None, **kwargs):
     """Connects _flash_attention_impl to the generated kernel."""
     block_b = q_tile_ref.shape[0]
 
-    # Create the real kernel from the factory
-    # ---------------------------------------------
     kernel = make_flash_attention_kernel(
         score_jaxpr=score_jaxpr,
     )
@@ -53,7 +50,6 @@ def _flash_attention_impl(
   batch_size, num_heads, q_seq_len, head_dim = q.shape
   _, _, kv_seq_len, _ = k.shape
 
-  # Grid specification
   grid = (
       pl.cdiv(batch_size, block_b),
       num_heads,
@@ -84,25 +80,23 @@ def _flash_attention_impl(
           jnp.zeros((block_q, head_dim), q.dtype),
           jnp.zeros((block_k, head_dim), k.dtype),
       )
-      # print(score_jaxpr.jaxpr)
   else:
       score_jaxpr = None
 
 
   kernel = functools.partial(
       _flash_attention_kernel,
-      causal = causal,
-      sm_scale = sm_scale,
-      block_k = block_k,
-      kv_seq_len = kv_seq_len,
-      score_jaxpr = score_jaxpr,
+      causal=causal,
+      sm_scale=sm_scale,
+      block_k=block_k,
+      kv_seq_len=kv_seq_len,
+      score_jaxpr=score_jaxpr,
   )
 
   out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
   out_shape = [out_shape]
   out_specs = [pl.BlockSpec((block_b, 1, block_q, head_dim), o_index_map)]
 
-  # Allocate scratch buffers
   if block_k != kv_seq_len:
     m_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
     l_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
@@ -111,7 +105,6 @@ def _flash_attention_impl(
   else:
     scratch_shapes = []
 
-  # Output specs
   if save_residuals:
     out_specs = [
         *out_specs,
@@ -163,7 +156,7 @@ def _flash_attention_impl(
     return o
 
 
-def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
+def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
   """Factory returning a kernel with an optional custom mask function."""
   def flash_attention_fwd_kernel(
       batch_idx,
@@ -186,6 +179,7 @@ def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
     block_k_major = k_tile_ref.shape[2]
     head_dim = k_tile_ref.shape[3]
     kv_seq_idx = pl.program_id(3)
+    q_seq_idx = pl.program_id(2)   
 
     @pl.when(kv_seq_idx == 0)
     def start_new_seq():
@@ -199,7 +193,6 @@ def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
     if mask_fn is None:
       should_run = True
 
-
     @pl.when(should_run)
     def body():
       @pl.loop(0, block_k_major, step=block_k, unroll=True)
@@ -211,68 +204,46 @@ def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
         q_ref = q_tile_ref[batch_idx]
 
         def _inline_jaxpr_score(q, k, closed_jaxpr):
-          """
-          Evaluates a ClosedJaxpr (forward-only) for score computation.
-          Args:
-              q, k: Input arrays.
-              closed_jaxpr: A jax.core.ClosedJaxpr instance.
-          """
           jaxpr = closed_jaxpr.jaxpr
           literals = closed_jaxpr.literals
-          
           env = {}
 
           def read(var):
-              # Handle literals (e.g., hardcoded numbers like 1.0 in equations)
               if isinstance(var, core.Literal):
                   return var.val
               return env[var]
 
           def write(var, val):
-              # Pallas usually prefers JAX arrays over Python scalars
               if not hasattr(val, 'dtype'):
                   val = jnp.asarray(val)
               env[var] = val
 
-          # 1. Bind Arguments (Q, K) to invars
           write(jaxpr.invars[0], q)
           write(jaxpr.invars[1], k)
-
-          # 2. Bind Constants (Captured variables) to constvars
           for var, val in zip(jaxpr.constvars, literals):
               write(var, val)
 
-          # 3. Execute Equations
           for eqn in jaxpr.eqns:
-              # Read inputs safely
               invals = [read(v) for v in eqn.invars]
-
-              # Execute Primitive
               outvals = eqn.primitive.bind(*invals, **eqn.params)
-
-              # Write outputs
               if not eqn.outvars:
                   continue
-              
               if eqn.primitive.multiple_results:
                   for var, val in zip(eqn.outvars, outvals):
                       write(var, val)
               else:
                   write(eqn.outvars[0], outvals)
 
-          # Return the single scalar score
           return read(jaxpr.outvars[0])
 
-
-
         if score_jaxpr is None:
-            S = jax.lax.dot_general(q_ref, k_ref, dimension_numbers,
-                                    preferred_element_type=jnp.float32)
+            S = jax.lax.dot_general(
+                q_ref, k_ref, dimension_numbers,
+                preferred_element_type=jnp.float32
+            )
             S = S * sm_scale
         else:
-            # 1. Check inputs for the default path
             S = _inline_jaxpr_score(q_ref, k_ref, score_jaxpr)
-
 
         if ab_tile_ref is not None:
           ab = ab_tile_ref[
@@ -280,12 +251,23 @@ def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
           ].astype(jnp.float32)
           S += ab
 
+        if causal:
+            q_start = q_seq_idx * q_ref.shape[0]  # block_q
+            k_start = kv_seq_idx * block_k_major + start_k
+
+            q_pos = (q_start + jnp.arange(q_ref.shape[0]))[:, None]
+            k_pos = (k_start + jnp.arange(block_k))[None, :]
+
+            causal_mask = k_pos > q_pos
+            S = jnp.where(causal_mask, -1e9, S)
 
         m_cur = jnp.max(S, axis=1)[:, None]
         m_next = jnp.maximum(m_cur, m_past)
         block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
         if rem:
-          raise NotImplementedError(f"{block_k=} should be a multiple of {MIN_BLOCK_SIZE}")
+          raise NotImplementedError(
+              f"{block_k=} should be a multiple of {MIN_BLOCK_SIZE}"
+          )
 
         P = jnp.exp(S - pltpu.repeat(m_next, block_k_repeats, 1))
         l_corr = jnp.exp(m_past - m_next) * l_past
@@ -293,7 +275,9 @@ def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
 
         head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
         if rem:
-          raise NotImplementedError(f"{head_dim=} should be a multiple of {MIN_BLOCK_SIZE} if larger")
+          raise NotImplementedError(
+              f"{head_dim=} should be a multiple of {MIN_BLOCK_SIZE} if larger"
+          )
 
         l_broadcast = lambda l: pltpu.repeat(l, head_dim_repeats, 1)
         l_scratch_ref[batch_idx] = l_next
@@ -301,14 +285,16 @@ def make_flash_attention_kernel(mask_fn=None,score_jaxpr=None):
 
         l_next_inv_safe = jnp.where(l_next == 0.0, 1.0, 1.0 / l_next)
         v_ref = v_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
-        o_curr = jax.lax.dot(P.astype(v_ref.dtype), v_ref, preferred_element_type=jnp.float32)
+        o_curr = jax.lax.dot(
+            P.astype(v_ref.dtype), v_ref,
+            preferred_element_type=jnp.float32
+        )
         O_scratch_ref[batch_idx] = O_past * l_broadcast(l_corr) + o_curr
         O_scratch_ref[batch_idx] *= l_broadcast(l_next_inv_safe)
 
     @pl.when(kv_seq_idx == (kv_seq_len // block_k_major) - 1)
     def store_res():
       O_tile_ref[batch_idx] = O_scratch_ref[batch_idx].astype(O_tile_ref.dtype)
-      # Only store m/l if they were requested (i.e., not None)
       if (m_tile_ref is not None) and (l_tile_ref is not None):
         m_tile_ref[batch_idx] = m_scratch_ref[batch_idx].astype(m_tile_ref.dtype)
         l_tile_ref[batch_idx] = l_scratch_ref[batch_idx].astype(l_tile_ref.dtype)

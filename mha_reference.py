@@ -14,6 +14,7 @@ def mha_reference(
     sm_scale: float = 1.0,
     save_residuals: bool = False,
     score_fn=None,
+    causal: bool = False,   
 ):
 
     batch, heads, q_len, dim = q.shape
@@ -28,27 +29,28 @@ def mha_reference(
         #    The user function expects (Q_seq, Dim), (K_seq, Dim)
         #    We must broadcast (vmap) it over Batch and Heads.
         
-        # Inner vmap: Maps over Heads (axis 1)
-        # Outer vmap: Maps over Batch (axis 0)
         batched_score = jax.vmap(
             jax.vmap(score_fn, in_axes=(0, 0)), 
             in_axes=(0, 0)
         )
 
-        
         logits = batched_score(q, k)
 
-        # Add bias if provided (standard broadcasting handles the rest)
+        # Add bias if provided
         if ab is not None:
             logits += ab
-            
-        # Note: If your custom score function DOES NOT handle scale, apply it here.
+
+        # If user score doesn't include sm_scale, you could apply it here.
         if sm_scale != 1.0:
-            # Heuristic: Check if user function likely applied it? 
-            # For safety in reference, we often assume user handles it in custom fn,
-            # but if you want to force it:
-            # logits = logits * sm_scale
+            # keep behavior same as your old version: assume user handles scale
             pass
+
+    if causal:
+        k_len = logits.shape[-1]
+        q_idx = jnp.arange(q_len)[:, None]      # (Q,1)
+        k_idx = jnp.arange(k_len)[None, :]     # (1,K)
+        causal_mask = k_idx > q_idx            # (Q,K)
+        logits = jnp.where(causal_mask, -1e9, logits)
 
     # -------------------------
     # Softmax & Output
