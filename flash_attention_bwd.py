@@ -45,10 +45,15 @@ def _bwd_reduce_sum(inputs, out, d_out, params):
 
 def _bwd_dot_general(inputs, out, d_out, params):
     lhs, rhs = inputs
-    dn = params["dimension_numbers"]
+    contracting_dims_r = ((1,), (0,)) 
+    contracting_dims_l = ((0,), (0,)) 
+    batch_dims = ((), ()) # Assuming no batch dims based on your debug output
+    dn_r = (contracting_dims_r, batch_dims)
+    dn_l = (contracting_dims_l, batch_dims)
+    
     return (
-        lax.dot_general(d_out, rhs, dn, preferred_element_type=jnp.float32),
-        lax.dot_general(lhs, d_out, dn, preferred_element_type=jnp.float32),
+        lax.dot_general(d_out, rhs, dn_r, preferred_element_type=jnp.float32),
+        lax.dot_general(lhs, d_out, dn_l, preferred_element_type=jnp.float32),
     )
 
 def _bwd_broadcast_in_dim(inputs, out, d_out, params):

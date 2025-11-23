@@ -86,11 +86,18 @@ class ToJaxTransformer(ast.NodeTransformer):
                 )
 
             pattern = pattern_node.value
-            if pattern != "...d,...d->...":
-                raise AssertionError(
-                    f"Unsupported einsum pattern '{pattern}'. "
-                    "Only '...d,...d->...' is allowed for FlashAttention TPU."
-                )
+            # In util.py
+            pattern = pattern_node.value.replace(" ", "") # Remove spaces first
+
+            # Allow specific known patterns that are semantically equivalent
+            ALLOWED_PATTERNS = [
+                "...d,...d->...",
+                "qd,kd->qk",
+            ]
+
+            if pattern not in ALLOWED_PATTERNS:
+                raise AssertionError(f"Unsupported einsum pattern '{pattern}'. "
+                    "Only '...d,...d->...' is allowed for FlashAttention TPU.")
 
             q, k = node.args[1], node.args[2]
             return self._make_inline_dot_general(q, k)

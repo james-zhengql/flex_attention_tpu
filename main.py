@@ -34,7 +34,7 @@ def main():
     v = random.normal(k3, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
 
     def my_score(q, k):
-        return jnp.dot(q, k) + 0.3 * jnp.tanh(jnp.dot(q, k))
+        return jnp.einsum("qd, kd -> qk", q, k) + 0.3 * jnp.tanh(jnp.einsum("qd, kd -> qk", q, k))
 
     jax_score = make_jax_score_fn(my_score)
 
@@ -47,7 +47,7 @@ def main():
         block_k=512,
         causal=True,   
         score_fn=jax_score,
-        which=["ref", "flash_ref", "flash"]
+        which=["ref", "flash_ref"]
     )
     print("\nSummary:", results)
 

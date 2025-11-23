@@ -81,12 +81,16 @@ def mha_bwd_reference(
     save_residuals: bool = True,
     score_fn = None
 ):
-
+    batched_score = jax.vmap(
+            jax.vmap(score_fn, in_axes=(0, 0)), 
+            in_axes=(0, 0)
+        )
+    
     if score_fn is None:
         logits = jnp.einsum("bhqc,bhkc->bhqk", q, k)
     else:
-        logits = score_fn(q, k)
-
+        logits = batched_score(q, k)
+    print(f"DEBUG: logits shape: {logits.shape}")
     if ab is not None:
         logits += ab
     if sm_scale != 1.0:
@@ -97,12 +101,15 @@ def mha_bwd_reference(
     # logits = logits if mask is None else logits + jnp.where(mask, 0.0, -1e9)
 
     # m = logits.max(axis=-1)
-    unnormalized = jnp.exp(logits - m[..., None])
+    unnormalized = jnp.exp(logits - m)
     # l = unnormalized.sum(axis=-1)
     # weights = unnormalized / l[..., None]
     # o = jnp.einsum("bhkq,bhkc->bhqc", weights, v)
-
-    p = unnormalized / l[..., None]
+    print(f"DEBUG: m shape: {m.shape}")
+    print(f"DEBUG: unnormalized shape: {unnormalized.shape}")
+    p = unnormalized / l
+    print(f"DEBUG: l shape: {l.shape}")
+    print(f"DEBUG: p shape: {p.shape}")
 
     # dv = P^T * do
     dv = jnp.einsum("bhqk,bhqc->bhkc", p, do)
@@ -118,7 +125,7 @@ def mha_bwd_reference(
         dq = jnp.einsum("bhqk,bhkc->bhqc", ds, k)
         dk = jnp.einsum("bhqk,bhqc->bhkc", ds, q)
     else:
-        _, vjp_fn = jax.vjp(score_fn, q, k)
+        _, vjp_fn = jax.vjp(batched_score, q, k)
         dq, dk = vjp_fn(ds)
 
 

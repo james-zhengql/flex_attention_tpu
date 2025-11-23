@@ -128,7 +128,7 @@ def build_fns_for_bench(
             dq, dk, dv = ref_bwd(q, k, v, o, do, l, m)
             return dq, dk, dv
 
-        out["ref_fwd_bwd_jit"] = jax.jit(ref_fwd_bwd, static_argnames=("score_fn",))
+        out["ref_fwd_bwd_jit"] = jax.jit(ref_fwd_bwd)
 
     # ========================================================
     # FLASH ATTENTION PALLAS KERNEL
@@ -157,7 +157,7 @@ def build_fns_for_bench(
             o, l, m = flash_fwd(q, k, v)
             return o, l, m  # no backward yet
 
-        out["flash_fwd_bwd_jit"] = jax.jit(flash_fwd_bwd, static_argnames=("score_fn",))
+        out["flash_fwd_bwd_jit"] = jax.jit(flash_fwd_bwd)
 
     # ========================================================
     # FLASH ATTENTION REFERENCE (FWD + BWD)
@@ -180,8 +180,6 @@ def build_fns_for_bench(
 
         flash_ref_bwd = functools.partial(
             flash_attention_bwd._flash_attention_bwd_dq,
-            ab=ab,
-            segment_ids=None,
             causal=causal,
             sm_scale=sm_scale,
             block_q_major=block_q,
@@ -197,7 +195,7 @@ def build_fns_for_bench(
             o, l, m = flash_ref_fwd(q, k, v)
             do = jnp.ones_like(o)
             di = jnp.ones_like(l)
-            dq, ds = flash_ref_bwd(q, k, v, l=l, m=m, do=do, di=di)
+            dq, ds = flash_ref_bwd(q, k, v, ab= None, l=l, m=m, do=do, di=di)
             return dq, ds
 
         out["flash_ref_fwd_bwd_jit"] = jax.jit(flash_ref_fwd_bwd)
