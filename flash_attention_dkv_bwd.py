@@ -11,7 +11,8 @@ import numpy as np
 import time
 import statistics as stats
 from jax import lax 
-
+from flash_attention_fwd_ref import _flash_attention_impl_ref
+from flex_attention_kernel import _flex_attention_impl
 
 dimension_numbers = (((1,), (1,)), ((), ()))
 MIN_BLOCK_SIZE = 128
@@ -328,7 +329,7 @@ def flash_attention_bwd_dkv(
     assert qo_spec.block_shape is not None
     assert q.ndim == len(qo_spec.block_shape)
 
-    di_spec = qo_spec
+    di_spec = pl.BlockSpec((1, 1, block_q_major, MIN_BLOCK_SIZE), qo_index_map)
     do_spec = qo_spec
     assert do.ndim == len(qo_spec.block_shape)
 
@@ -503,7 +504,7 @@ def flash_attention_dkv_kernel(
 
             dP = jax.lax.dot_general(dO,v,dimension_numbers,preferred_element_type=jnp.float32)
   
-
+            print(f"di shape{di.shape}")
             dS = P * (dP - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1))
 
             if sm_scale != 1.0:
@@ -550,7 +551,7 @@ def mha_reference_bwd(
     logits *= sm_scale
 
   if ab is not None:
-    logits += abf
+    logits += ab
 
   mask = None
   if segment_ids is not None:
@@ -567,21 +568,30 @@ def mha_reference_bwd(
     mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
 
   logits = logits if mask is None else logits + jnp.where(mask, 0.0, mask_value)
-
+  # jax.debug.print("logits norm: {x:.3e}", x=jnp.linalg.norm(logits))
+  # jax.debug.print("logits - m norm: {x:.3e}", x=jnp.linalg.norm(logits - m[..., None]))
+  # jax.debug.print("mnorm: {x:.3e}", x=jnp.linalg.norm(m))
   unnormalized = jnp.exp(logits - m[..., None])
+  # jax.debug.print("exp norm: {x:.3e}", x=jnp.linalg.norm(unnormalized))
   p = unnormalized / l[..., None]
+  # jax.debug.print("p norm: {x:.3e}", x=jnp.linalg.norm(p))
+
   dv = jnp.einsum("bhpt,bhpd->bhtd", p, do.astype(jnp.float32)).astype(v.dtype)
 
   dp = jnp.einsum(
       "bhpd,bhtd->bhpt", do.astype(jnp.float32), v.astype(jnp.float32)
   )
+  # jax.debug.print("dp norm: {x:.3e}", x=jnp.linalg.norm(dp))
 
   di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)[
       ..., None
   ]  # [batch_size, num_heads, q_seq_len]
 
   ds = (dp - di) * p
+  # jax.debug.print("ds norm before scale: {x:.3e}", x=jnp.linalg.norm(ds))
   ds = ds * sm_scale
+  # Requires: import jax
+  # jax.debug.print("ds norm: {x:.3e}", x=jnp.linalg.norm(ds))
 
   dk = jnp.einsum("bhsd,bhst->bhtd", q.astype(jnp.float32), ds).astype(k.dtype)
   dq = jnp.einsum("bhst,bhtd->bhsd", ds, k.astype(jnp.float32)).astype(q.dtype)
@@ -779,10 +789,11 @@ def run_bench_suite(
     dk_out.block_until_ready()
     dv_out.block_until_ready()
 
-    rel_dk = jnp.linalg.norm(dk_out - dk_ref) / jnp.linalg.norm(dk_ref)
+    rel_dk = jnp.linalg.norm(dk_out - dk_ref) /jnp.linalg.norm(dk_ref)
     rel_dv = jnp.linalg.norm(dv_out - dv_ref) / jnp.linalg.norm(dv_ref)
-    print(f"Numeric dk diff (Relative L2): {rel_dk:.3e}")
-    print(f"Numeric dv diff (Relative L2): {rel_dv:.3e}")
+    # print(f"Numeric dk diff (Relative L2): {rel_dk:.3e}")
+    # print(f"ref: {jnp.linalg.norm(dk_ref):.3e}")
+    # print(f"Numeric dv diff (Relative L2): {rel_dv:.3e}")
 
     return {
         "ref_ms_med": t_med_ref * 1e3,
@@ -797,9 +808,9 @@ def main():
   key = random.PRNGKey(0)
   batch = 1
   heads = 1
-  q_len = 128 * 64
-  kv_len = 128 * 64
-  head_dim = 128
+  q_len = 12800
+  kv_len = 12800
+  head_dim = 256
 
   k1, k2, k3, k4 = random.split(key, 4)
   q = random.normal(k1, (batch, heads, q_len, head_dim), dtype=jnp.float32)
@@ -822,14 +833,25 @@ def main():
 
 
   print("Running Pallas TPU flash attention kernel...")
-  o, l, m = _flash_attention_impl(
+  o_ref, l_ref, m_ref = mha_reference (
+      q=q, k=k, v=v,
+      save_residuals=save_residuals
+  )
+
+  o, l, m = _flex_attention_impl(
       q=q, k=k, v=v, ab=ab, segment_ids=segment_ids,
       save_residuals=save_residuals,
       causal=causal, sm_scale=sm_scale,
       block_b=block_b, block_q=block_q_major,
       block_k_major=block_k_major, block_k=block_k,
-      debug=debug,
+      debug=debug,score_fn=None
   )
+
+  print(f"o diff: {jnp.linalg.norm(o_ref - o)/jnp.linalg.norm(o_ref):.3e}")
+  print(f"l diff: {jnp.linalg.norm(l_ref - l)/jnp.linalg.norm(l_ref):.3e}")
+  print(f"m diff: {jnp.linalg.norm(m_ref - m)//jnp.linalg.norm(m_ref):.3e}")
+
+  
 
   di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)
 

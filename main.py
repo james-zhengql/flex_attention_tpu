@@ -45,9 +45,9 @@ def main():
         block_q=1024,
         block_k_major=1024,
         block_k=512,
-        causal=True,   
-        score_fn=jax_score,
-        which=["ref", "flash_ref"]
+        causal=False,   
+        score_fn=None,
+        which=["ref","flash", "flash_ref"]
     )
     print("\nSummary:", results)
 

@@ -18,32 +18,33 @@ def mha_reference(
 ):
 
     batch, heads, q_len, dim = q.shape
+    logits = jnp.einsum("bhqc,bhkc->bhqk", q, k) * sm_scale
 
-    if score_fn is None:
-        # Default Dot-Product
-        logits = jnp.einsum("bhqc,bhkc->bhqk", q, k) * sm_scale
-        if ab is not None:
-            logits += ab
-    else:
-        # 2. Apply the Custom Score
-        #    The user function expects (Q_seq, Dim), (K_seq, Dim)
-        #    We must broadcast (vmap) it over Batch and Heads.
+    # if score_fn is None:
+    #     # Default Dot-Product
+    #     logits = jnp.einsum("bhqc,bhkc->bhqk", q, k) * sm_scale
+    #     if ab is not None:
+    #         logits += ab
+    # else:
+    #     # 2. Apply the Custom Score
+    #     #    The user function expects (Q_seq, Dim), (K_seq, Dim)
+    #     #    We must broadcast (vmap) it over Batch and Heads.
         
-        batched_score = jax.vmap(
-            jax.vmap(score_fn, in_axes=(0, 0)), 
-            in_axes=(0, 0)
-        )
+    #     batched_score = jax.vmap(
+    #         jax.vmap(score_fn, in_axes=(0, 0)), 
+    #         in_axes=(0, 0)
+    #     )
 
-        logits = batched_score(q, k)
+    #     logits = batched_score(q, k)
 
-        # Add bias if provided
-        if ab is not None:
-            logits += ab
+    #     # Add bias if provided
+    #     if ab is not None:
+    #         logits += ab
 
-        # If user score doesn't include sm_scale, you could apply it here.
-        if sm_scale != 1.0:
-            # keep behavior same as your old version: assume user handles scale
-            pass
+    #     # If user score doesn't include sm_scale, you could apply it here.
+    #     if sm_scale != 1.0:
+    #         # keep behavior same as your old version: assume user handles scale
+    #         pass
 
     if causal:
         k_len = logits.shape[-1]
@@ -55,11 +56,10 @@ def mha_reference(
     # -------------------------
     # Softmax & Output
     # -------------------------
-    m = jnp.max(logits, axis=-1, keepdims=True)
-    unn = jnp.exp(logits - m)
-    l = jnp.sum(unn, axis=-1, keepdims=True)
-    weights = unn / l
-
+    m = logits.max(axis=-1)
+    unnormalized = jnp.exp(logits - m[..., None])
+    l = unnormalized.sum(axis=-1)
+    weights = unnormalized / l[..., None]
     out = jnp.einsum("bhqk,bhkc->bhqc", weights, v)
 
     return (out, l, m) if save_residuals else out

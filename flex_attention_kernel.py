@@ -18,7 +18,7 @@ def _flash_attention_kernel(q_tile_ref, *args, score_jaxpr=None, **kwargs):
     block_b = q_tile_ref.shape[0]
 
     kernel = make_flash_attention_kernel(
-        score_jaxpr=score_jaxpr,
+        # score_jaxpr=score_jaxpr,
     )
 
     for batch_idx in range(block_b):
@@ -31,7 +31,7 @@ def _flash_attention_kernel(q_tile_ref, *args, score_jaxpr=None, **kwargs):
 
 
 
-def _flash_attention_impl(
+def _flex_attention_impl(
     q,
     k,
     v,
@@ -154,7 +154,7 @@ def _flash_attention_impl(
     return (o, l, m)
   else:
     return o
-
+  
 
 def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
   """Factory returning a kernel with an optional custom mask function."""
@@ -165,11 +165,11 @@ def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
       v_tile_ref,
       ab_tile_ref,
       O_tile_ref,
-      m_tile_ref,
       l_tile_ref,
-      O_scratch_ref,
+      m_tile_ref,
       m_scratch_ref,
       l_scratch_ref,
+      O_scratch_ref,
       *,
       causal,
       sm_scale,
@@ -245,6 +245,11 @@ def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
         else:
             S = _inline_jaxpr_score(q_ref, k_ref, score_jaxpr)
 
+        S = jax.lax.dot_general(
+                q_ref, k_ref, dimension_numbers,
+                preferred_element_type=jnp.float32
+            )
+
         if ab_tile_ref is not None:
           ab = ab_tile_ref[
               (*batch_idx, pl.dslice(None), pl.dslice(start_k, block_k))
@@ -296,7 +301,6 @@ def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
     def store_res():
       O_tile_ref[batch_idx] = O_scratch_ref[batch_idx].astype(O_tile_ref.dtype)
       if (m_tile_ref is not None) and (l_tile_ref is not None):
-        m_tile_ref[batch_idx] = m_scratch_ref[batch_idx].astype(m_tile_ref.dtype)
         l_tile_ref[batch_idx] = l_scratch_ref[batch_idx].astype(l_tile_ref.dtype)
-
+        m_tile_ref[batch_idx] = m_scratch_ref[batch_idx].astype(m_tile_ref.dtype)
   return flash_attention_fwd_kernel

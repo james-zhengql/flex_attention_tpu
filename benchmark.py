@@ -9,6 +9,7 @@ import flash_attention_fwd_ref
 import flex_attention_kernel
 import flash_attention_bwd
 from mha_reference import mha_reference, mha_bwd_reference
+from jax_exp import mha_reference_no_custom_vjp
 
 
 # ============================================================
@@ -111,31 +112,31 @@ def build_fns_for_bench(
         )
         out["ref_fwd_jit"] = jax.jit(ref_fwd, static_argnames=("score_fn",))
 
-        # Backward (needs o, l, m from fwd)
-        ref_bwd = functools.partial(
-            mha_bwd_reference,
-            ab=None,
-            sm_scale=sm_scale,
-            save_residuals=True,
-            score_fn=score_fn,
-        )
-        out["ref_bwd_jit"] = jax.jit(ref_bwd, static_argnames=("score_fn",))
+        # # Backward (needs o, l, m from fwd)
+        # ref_bwd = functools.partial(
+        #     mha_bwd_reference,
+        #     ab=None,
+        #     sm_scale=sm_scale,
+        #     save_residuals=True,
+        #     score_fn=score_fn,
+        # )
+        # out["ref_bwd_jit"] = jax.jit(ref_bwd, static_argnames=("score_fn",))
 
-        # Combined: fwd + bwd
-        def ref_fwd_bwd(q, k, v):
-            o, l, m = ref_fwd(q, k, v)
-            do = jnp.ones_like(o)
-            dq, dk, dv = ref_bwd(q, k, v, o, do, l, m)
-            return dq, dk, dv
+        # # Combined: fwd + bwd
+        # def ref_fwd_bwd(q, k, v):
+        #     o, l, m = ref_fwd(q, k, v)
+        #     do = jnp.ones_like(o)
+        #     dq, dk, dv = ref_bwd(q, k, v, o, do, l, m)
+        #     return dq, dk, dv
 
-        out["ref_fwd_bwd_jit"] = jax.jit(ref_fwd_bwd)
+        # out["ref_fwd_bwd_jit"] = jax.jit(ref_fwd_bwd)
 
     # ========================================================
     # FLASH ATTENTION PALLAS KERNEL
     # ========================================================
     if "flash" in which:
         flash_fwd = functools.partial(
-            flex_attention_kernel._flash_attention_impl,
+            flex_attention_kernel._flex_attention_impl,
             ab=ab,
             segment_ids=None,
             save_residuals=True,
@@ -153,11 +154,11 @@ def build_fns_for_bench(
         # Backward — unavailable for flash (you didn't provide it)
         # So skip flash_bwd
 
-        def flash_fwd_bwd(q, k, v):
-            o, l, m = flash_fwd(q, k, v)
-            return o, l, m  # no backward yet
+        # def flash_fwd_bwd(q, k, v):
+        #     o, l, m = flash_fwd(q, k, v)
+        #     return o, l, m  # no backward yet
 
-        out["flash_fwd_bwd_jit"] = jax.jit(flash_fwd_bwd)
+        # out["flash_fwd_bwd_jit"] = jax.jit(flash_fwd_bwd)
 
     # ========================================================
     # FLASH ATTENTION REFERENCE (FWD + BWD)
@@ -178,27 +179,27 @@ def build_fns_for_bench(
         )
         out["flash_ref_fwd_jit"] = jax.jit(flash_ref_fwd)
 
-        flash_ref_bwd = functools.partial(
-            flash_attention_bwd._flash_attention_bwd_dq,
-            causal=causal,
-            sm_scale=sm_scale,
-            block_q_major=block_q,
-            block_k_major=block_k_major,
-            block_k=block_k,
-            debug=debug,
-            score_fn=score_fn,
-        )
-        out["flash_ref_bwd_jit"] = jax.jit(flash_ref_bwd)
+        # flash_ref_bwd = functools.partial(
+        #     flash_attention_bwd._flash_attention_bwd_dq,
+        #     causal=causal,
+        #     sm_scale=sm_scale,
+        #     block_q_major=block_q,
+        #     block_k_major=block_k_major,
+        #     block_k=block_k,
+        #     debug=debug,
+        #     score_fn=score_fn,
+        # )
+        # out["flash_ref_bwd_jit"] = jax.jit(flash_ref_bwd)
 
-        # Combined: fwd + bwd
-        def flash_ref_fwd_bwd(q, k, v):
-            o, l, m = flash_ref_fwd(q, k, v)
-            do = jnp.ones_like(o)
-            di = jnp.ones_like(l)
-            dq, ds = flash_ref_bwd(q, k, v, ab= None, l=l, m=m, do=do, di=di)
-            return dq, ds
+        # # Combined: fwd + bwd
+        # def flash_ref_fwd_bwd(q, k, v):
+        #     o, l, m = flash_ref_fwd(q, k, v)
+        #     do = jnp.ones_like(o)
+        #     di = jnp.ones_like(l)
+        #     dq, ds = flash_ref_bwd(q, k, v, ab= None, l=l, m=m, do=do, di=di)
+        #     return dq, ds
 
-        out["flash_ref_fwd_bwd_jit"] = jax.jit(flash_ref_fwd_bwd)
+        # out["flash_ref_fwd_bwd_jit"] = jax.jit(flash_ref_fwd_bwd)
 
     return out
 
@@ -231,7 +232,7 @@ def run_bench_suite(
         block_q=block_q,
         block_k_major=block_k_major,
         block_k=block_k,
-        score_fn=score_fn,
+        # score_fn=score_fn,
         which=which,
     )
 
@@ -246,42 +247,70 @@ def run_bench_suite(
     for name in ("ref_fwd_jit", "flash_fwd_jit", "flash_ref_fwd_jit"):
         if name in compiled:
             fn = compiled[name]
-            t_mean, t_med = benchmark(fn, (q, k, v), name=name)
+            t_mean, t_med = benchmark(fn, (q, k, v), iters=10, name=name)
             print(f"  → FWD Throughput: {gflops/t_med:.2f} GFLOP/s\n")
             results[name] = (t_mean, t_med)
+    
+    print("--- Numeric Accuracy (vs ref_fwd_jit) ---")
+    
+    # Pre-compute Reference Outputs
+    ref_fwd_out = None
 
-    # ======================================================
-    # BACKWARD BENCHMARKS
-    # ======================================================
-    for name in ("ref_bwd_jit", "flash_bwd_jit", "flash_ref_bwd_jit"):
-        if name in compiled:
-            fn = compiled[name]
-            # backward needs extra args
-            if name == "ref_bwd_jit":
-                o, l, m = compiled["ref_fwd_jit"](q, k, v)
-                do = jnp.ones_like(o)
-                args = (q, k, v, o, do, l, m)
-            elif name == "flash_ref_bwd_jit":
-                o, l, m = compiled["flash_ref_fwd_jit"](q, k, v)
-                do = jnp.ones_like(o)
-                di = jnp.ones_like(l)
-                args = (q, k, v, None, l, m, do, di)
-            else:
-                continue
+    if "ref_fwd_jit" in compiled:
+        ref_fwd_out = compiled["ref_fwd_jit"](q, k, v)
+        # Block to ensure it's computed before comparing
+        jax.tree_util.tree_map(lambda x: x.block_until_ready(), ref_fwd_out)
 
-            t_mean, t_med = benchmark(fn, args, name=name)
-            print(f"  → BWD Throughput: {gflops/t_med:.2f} GFLOP/s\n")
-            results[name] = (t_mean, t_med)
+    for name, fn in compiled.items():
+        if "ref" in name and "flash" not in name: continue # Skip comparing ref to itself
 
-    # ======================================================
-    # COMBINED BENCHMARKS
-    # ======================================================
-    for name in ("ref_fwd_bwd_jit", "flash_fwd_bwd_jit", "flash_ref_fwd_bwd_jit"):
-        if name in compiled:
-            fn = compiled[name]
-            t_mean, t_med = benchmark(fn, (q, k, v), name=name)
-            print(f"  → FWD+BWD Throughput: {gflops/t_med:.2f} GFLOP/s\n")
-            results[name] = (t_mean, t_med)
+        test_out = fn(q, k, v)
+        jax.tree_util.tree_map(lambda x: x.block_until_ready(), test_out)
+
+        diff_res = {}
+        
+
+        if "fwd" in name and ref_fwd_out is not None:
+             # Standard Flash fwd returns (o, l, m), Ref usually (o, l, m) or just o
+             # Ensure your Ref wrapper returns consistent outputs for valid comparison
+             diff_res = compute_diff(ref_fwd_out, test_out)
+             print(f"[{name}] vs [ref_fwd]: {diff_res}")
+        else:
+             print(f"[{name}] Skipped diff (no matching reference output found)")
 
     return results
+    # # ======================================================
+    # # BACKWARD BENCHMARKS
+    # # ======================================================
+    # for name in ("ref_bwd_jit", "flash_bwd_jit", "flash_ref_bwd_jit"):
+    #     if name in compiled:
+    #         fn = compiled[name]
+    #         # backward needs extra args
+    #         if name == "ref_bwd_jit":
+    #             o, l, m = compiled["ref_fwd_jit"](q, k, v)
+    #             do = jnp.ones_like(o)
+    #             args = (q, k, v, o, do, l, m)
+    #         elif name == "flash_ref_bwd_jit":
+    #             o, l, m = compiled["flash_ref_fwd_jit"](q, k, v)
+    #             do = jnp.ones_like(o)
+    #             di = jnp.ones_like(l)
+    #             args = (q, k, v, None, l, m, do, di)
+    #         else:
+    #             continue
+
+    #         t_mean, t_med = benchmark(fn, args, name=name)
+    #         print(f"  → BWD Throughput: {gflops/t_med:.2f} GFLOP/s\n")
+    #         results[name] = (t_mean, t_med)
+
+    # # ======================================================
+    # # COMBINED BENCHMARKS
+    # # ======================================================
+    # for name in ("ref_fwd_bwd_jit", "flash_fwd_bwd_jit", "flash_ref_fwd_bwd_jit"):
+    #     if name in compiled:
+    #         fn = compiled[name]
+    #         t_mean, t_med = benchmark(fn, (q, k, v), name=name)
+    #         print(f"  → FWD+BWD Throughput: {gflops/t_med:.2f} GFLOP/s\n")
+    #         results[name] = (t_mean, t_med)
+
+    # return results
 

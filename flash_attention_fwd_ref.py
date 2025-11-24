@@ -67,10 +67,10 @@ def _flash_attention_kernel_single_batch(
           q, k, dimension_numbers, preferred_element_type=jnp.float32
       )  # [block_q, block_k]
 
-      nonlinear_term = 0.3 * jnp.tanh(jax.lax.dot_general(
-          q, k, dimension_numbers, preferred_element_type=jnp.float32
-      ))
-      s = s + nonlinear_term
+      # nonlinear_term = 0.3 * jnp.tanh(jax.lax.dot_general(
+      #     q, k, dimension_numbers, preferred_element_type=jnp.float32
+      # ))
+      # s = s + nonlinear_term
 
       if ab_tile_ref is not None:
         ab = ab_tile_ref[
