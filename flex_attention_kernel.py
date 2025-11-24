@@ -18,7 +18,7 @@ def _flash_attention_kernel(q_tile_ref, *args, score_jaxpr=None, **kwargs):
     block_b = q_tile_ref.shape[0]
 
     kernel = make_flash_attention_kernel(
-        # score_jaxpr=score_jaxpr,
+        score_jaxpr=score_jaxpr,
     )
 
     for batch_idx in range(block_b):
@@ -90,7 +90,7 @@ def _flex_attention_impl(
       sm_scale=sm_scale,
       block_k=block_k,
       kv_seq_len=kv_seq_len,
-      score_jaxpr=score_jaxpr,
+      score_jaxpr=score_fn,
   )
 
   out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
@@ -243,7 +243,7 @@ def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
             )
             S = S * sm_scale
         else:
-            S = _inline_jaxpr_score(q_ref, k_ref, score_jaxpr)
+            S = score_jaxpr(q_ref, k_ref)
 
         S = jax.lax.dot_general(
                 q_ref, k_ref, dimension_numbers,

@@ -13,6 +13,7 @@ import statistics as stats
 from jax import lax 
 from flash_attention_fwd_ref import _flash_attention_impl_ref
 from flex_attention_kernel import _flex_attention_impl
+from util import _inline_jaxpr_score_backward, make_jax_score_fn
 
 dimension_numbers = (((1,), (1,)), ((), ()))
 MIN_BLOCK_SIZE = 128
@@ -305,6 +306,7 @@ def flash_attention_bwd_dkv(
     causal: bool,
     # mask_value: float,
     debug: bool,
+    score_fn = None
 ):
     batch_size, head_num, q_seq_len, head_dim = q.shape
     _, _, kv_seq_len, _ = k.shape
@@ -397,6 +399,14 @@ def flash_attention_bwd_dkv(
     # else:
     #     scratch_shapes = []
 
+    if score_fn is not None:
+      score_jaxpr = jax.make_jaxpr(score_fn)(
+          jnp.zeros((block_q, head_dim), q.dtype),
+          jnp.zeros((block_k, head_dim), k.dtype),
+      )
+    else:
+        score_jaxpr = None
+
     kernel = functools.partial(
         flash_attention_dkv_kernel,
         causal = causal,
@@ -406,6 +416,7 @@ def flash_attention_bwd_dkv(
         q_seq_len = q_seq_len,
         block_q_major = block_q_major,
         block_k_major=block_k_major,
+        score_jaxpr= score_fn
         # block_b = block_b,
     )
 
@@ -451,7 +462,8 @@ def flash_attention_dkv_kernel(
       block_k,
       q_seq_len,
       block_q_major,
-      block_k_major
+      block_k_major,
+      score_jaxpr
   ):
 
     _, _, q_seq_length, _ = q_tile_ref.shape
@@ -489,7 +501,11 @@ def flash_attention_dkv_kernel(
             dk_past = dk_scratch_ref[pl.ds(start_k, block_k), :]
             dv_past = dv_scratch_ref[pl.ds(start_k, block_k), :]
                         
-            S = jax.lax.dot_general(q, k, dimension_numbers, preferred_element_type=jnp.float32)  # block_q * block_k
+            if score_jaxpr is not None:
+                S, score_grad_fn = jax.vjp(score_jaxpr, q, k)
+            else:
+                S = jax.lax.dot_general(q, k, dimension_numbers, preferred_element_type=jnp.float32)
+                score_grad_fn = None
 
             S = S * sm_scale
             # unnormalized = jnp.exp(S - m_block[:, None])
@@ -504,14 +520,22 @@ def flash_attention_dkv_kernel(
 
             dP = jax.lax.dot_general(dO,v,dimension_numbers,preferred_element_type=jnp.float32)
   
-            print(f"di shape{di.shape}")
+            # print(f"di shape{di.shape}")
             dS = P * (dP - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1))
 
             if sm_scale != 1.0:
               dS = dS * sm_scale  
 
-            dk_update = jax.lax.dot(dS.T.astype(dO.dtype), q, preferred_element_type=jnp.float32)
-
+            # --- CHANGE 2: Backward Pass using Saved Residuals ---
+            if score_grad_fn is not None:
+              # This uses the residuals saved from step 1. 
+              # It's fused and efficient. 
+              # jax.vjp returns a tuple (dQ, dK)
+              dq_update, dk_update = score_grad_fn(dS)
+            else:
+              dk_update = jax.lax.dot(dS.T.astype(dO.dtype), q, preferred_element_type=jnp.float32)
+            
+            print(f"dk shape{dk_update.shape}")
             dk = dk_past + dk_update
 
             dk_scratch_ref[pl.dslice(start_k, block_k), :] = dk.astype(dk_scratch_ref.dtype)
@@ -697,6 +721,7 @@ def build_fns_for_bench(
     block_k=128,
     debug=False,
     block_q_major=128,
+    score_fn = None
 ):
     # ---------- Reference backward ----------
     ref_fn = functools.partial(
@@ -722,6 +747,7 @@ def build_fns_for_bench(
         block_k_major=block_k_major,
         block_k=block_k,
         debug=debug,
+        score_fn = score_fn
     )
 
   
@@ -741,6 +767,7 @@ def run_bench_suite(
     block_k,
     block_q_major,
     causal=False,
+    score_fn=None
 ):
     # Unpack shapes
     b, h, q_len, d = q.shape
@@ -759,6 +786,7 @@ def run_bench_suite(
         block_k=block_k,
         debug=False,
         block_q_major=block_q_major,
+        score_fn=score_fn
     )
 
     print(f"\n== Benchmark config: b={b}, h={h}, q={q_len}, k={k_len}, d={d}, causal={causal} ==")
@@ -857,6 +885,10 @@ def main():
 
 #performence comparison
 #Run the benchmark comparison
+  def my_score(q, k):
+      return jnp.einsum("qd, kd -> qk", q, k)
+  
+  jax_score = make_jax_score_fn(my_score)
   results = run_bench_suite(
       k=k, v=v, q=q, l=l, m=m, di=di, do=do, o=o, ab=ab, segment_ids=segment_ids,
       sm_scale=sm_scale,
@@ -866,6 +898,7 @@ def main():
       block_q_major=block_q_major,
       block_k=block_k,
       causal=causal,
+      score_fn=jax_score
   )
 
   print("\nSummary:", results)

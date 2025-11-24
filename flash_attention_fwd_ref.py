@@ -3,6 +3,7 @@ import functools
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax import lax as lax
 
 import jax.numpy as jnp
 
@@ -63,15 +64,8 @@ def _flash_attention_kernel_single_batch(
           (*batch_idx, pl.dslice(start_k, block_k), slice(None))
       ]  # [block_k, head_dim]
 
-      s = jax.lax.dot_general(
-          q, k, dimension_numbers, preferred_element_type=jnp.float32
-      )  # [block_q, block_k]
-
-      # nonlinear_term = 0.3 * jnp.tanh(jax.lax.dot_general(
-      #     q, k, dimension_numbers, preferred_element_type=jnp.float32
-      # ))
-      # s = s + nonlinear_term
-
+      # s = jnp.add(lax.dot_general(q, k, (((1,), (1,)), ((), ()))), jnp.multiply(0.3, jnp.tanh(lax.dot_general(q, k, (((1,), (1,)), ((), ()))))))
+      s = lax.dot_general(q, k, (((1,), (1,)), ((), ())))
       if ab_tile_ref is not None:
         ab = ab_tile_ref[
             (*batch_idx, pl.dslice(None), pl.dslice(start_k, block_k))

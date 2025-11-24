@@ -47,7 +47,7 @@ def main():
         block_k=512,
         causal=False,   
         score_fn=None,
-        which=["ref","flash", "flash_ref"]
+        which=["flash", "flash_ref"]
     )
     print("\nSummary:", results)
 

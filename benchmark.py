@@ -9,7 +9,7 @@ import flash_attention_fwd_ref
 import flex_attention_kernel
 import flash_attention_bwd
 from mha_reference import mha_reference, mha_bwd_reference
-from jax_exp import mha_reference_no_custom_vjp
+from jax_exp import mha_reference_no_custom_vjp,_flash_attention_impl
 
 
 # ============================================================
@@ -232,7 +232,7 @@ def run_bench_suite(
         block_q=block_q,
         block_k_major=block_k_major,
         block_k=block_k,
-        # score_fn=score_fn,
+        score_fn=score_fn,
         which=which,
     )
 
@@ -256,8 +256,8 @@ def run_bench_suite(
     # Pre-compute Reference Outputs
     ref_fwd_out = None
 
-    if "ref_fwd_jit" in compiled:
-        ref_fwd_out = compiled["ref_fwd_jit"](q, k, v)
+    if "flash_ref_fwd_jit" in compiled:
+        ref_fwd_out = compiled["flash_ref_fwd_jit"](q, k, v)
         # Block to ensure it's computed before comparing
         jax.tree_util.tree_map(lambda x: x.block_until_ready(), ref_fwd_out)
 
