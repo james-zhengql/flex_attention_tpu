@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import time
 import statistics as stats
-
+from util import _inline_jaxpr_score_backward, make_jax_score_fn
 
 dimension_numbers = (((1,), (1,)), ((), ()))
 MIN_BLOCK_SIZE = 128
@@ -158,6 +158,7 @@ def flash_attention_bwd_dq(
     causal: bool,
     mask_value: float,
     debug: bool,
+    score_fn = None
 ):
     # broadcast l,m,d
     l = jnp.broadcast_to(l[..., None], (*l.shape, MIN_BLOCK_SIZE))
@@ -249,7 +250,14 @@ def flash_attention_bwd_dq(
       jax.ShapeDtypeStruct(q.shape, q.dtype),
     ]
 
-
+    if score_fn is not None:
+      score_jaxpr = jax.make_jaxpr(score_fn)(
+          jnp.zeros((block_q, head_dim), q.dtype),
+          jnp.zeros((block_k, head_dim), k.dtype),
+      )
+    else:
+        score_jaxpr = None
+    
     kernel = functools.partial(
         _flash_attention_bwd_dq,
         causal = causal,
@@ -257,7 +265,8 @@ def flash_attention_bwd_dq(
         block_q = block_q,
         block_k = block_k,
         q_seq_len = q_seq_len,
-        kv_seq_len = kv_seq_len
+        kv_seq_len = kv_seq_len,
+        score_jaxpr= score_fn
     )
 
     dq, *aux = pl.pallas_call(
@@ -311,6 +320,7 @@ def flash_attention_bwd_dq_kernel(
       block_k,
       q_seq_len,
       kv_seq_len,
+      score_jaxpr
   ):
 
     kv_tile_idx = pl.program_id(axis = 3)
@@ -340,7 +350,13 @@ def flash_attention_bwd_dq_kernel(
             dq_past = dq_scratch_ref[batch_idx]
 
             # S = QK^T
-            S = jax.lax.dot_general(q, k, dimension_numbers, preferred_element_type=jnp.float32)
+
+            # --- CHANGE 1: Backward Pass Score ---
+            if score_jaxpr is not None:
+                S, score_grad_fn = jax.vjp(score_jaxpr, q, k)
+            else:
+                S = jax.lax.dot_general(q, k, dimension_numbers, preferred_element_type=jnp.float32)
+                score_grad_fn = None
             S = S * sm_scale
             # P(i,j) = exp(S(i,j)-L(i))
             unnormalized = jnp.exp(S - pltpu.repeat(m, block_k_repeats, axis=1))
@@ -351,7 +367,17 @@ def flash_attention_bwd_dq_kernel(
             dS = P * (dP  - pltpu.repeat(D, block_k_repeats, axis=1))
             dS = dS * sm_scale
             # dQ(i) = dQi + dS(i,j) * k(j)
-            dq = dq_past + jax.lax.dot_general(dS,k,(((1,), (0,)), ((), ())),preferred_element_type=jnp.float32)
+
+            # --- CHANGE 2: Backward Pass using Saved Residuals ---
+            if score_grad_fn is not None:
+              # This uses the residuals saved from step 1. 
+              # It's fused and efficient. 
+              # jax.vjp returns a tuple (dQ, dK)
+              dq_update, dk_update = score_grad_fn(dS)
+            else:
+              dq_update = jax.lax.dot_general(dS,k,(((1,), (0,)), ((), ())),preferred_element_type=jnp.float32)
+
+            dq = dq_past + dq_update
 
             dq_scratch_ref[batch_idx] = dq.astype(dq_scratch_ref.dtype)
 
@@ -422,6 +448,7 @@ def build_fns_for_bench(
     block_k_major=128,
     block_k=128,
     debug=False,
+    score_fn = None
 ):
     batch_size, head_num, q_seq_len, head_dim = q.shape
     _, _, kv_seq_len, _ = k.shape
@@ -444,6 +471,7 @@ def build_fns_for_bench(
         segment_ids = None,
         mask_value = None,
         debug = False,
+        score_fn = score_fn
     )
     def flash_bwd_fn(q, k, v, l, m, o, do, d):
         return flash_partial(q=q, k=k, v=v, l=l, m=m, o=o, do=do, d=d)
@@ -452,7 +480,7 @@ def build_fns_for_bench(
 
     return ref_jit, flash_jit
 
-def run_bench_suite(q, k, v, l, m, o, do, d, *, sm_scale, block_b, block_q, block_q_major, block_k_major, block_k, causal=False):
+def run_bench_suite(q, k, v, l, m, o, do, d, *, sm_scale, block_b, block_q, block_q_major, block_k_major, block_k, causal=False, score_fn=None):
     # Unpack shapes
     b, h, q_len, h_d = q.shape
     _, _, k_len, _ = k.shape
@@ -473,6 +501,7 @@ def run_bench_suite(q, k, v, l, m, o, do, d, *, sm_scale, block_b, block_q, bloc
         block_k_major=block_k_major,
         block_k=block_k,
         debug=False,
+        score_fn=score_fn
     )
 
     print(f"\n== Benchmark config: b={b}, h={h}, q={q_len}, k={k_len}, d={d}, causal={causal} ==")
@@ -553,6 +582,14 @@ def main():
     do = jax.random.normal(key, o.shape)
     d = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)
 
+    # Add Score
+    #performence comparison
+    #Run the benchmark comparison
+    def my_score(q, k):
+        return jnp.einsum("qd, kd -> qk", q, k)
+    
+    jax_score = make_jax_score_fn(my_score)
+
     print("Running reference attention backward (for numeric check)...")
     # Call mha_bwd_reference
     dq_ref, dk_ref, dv_ref = mha_bwd_reference(q, k, v, o, do, l, m, sm_scale=sm_scale)
@@ -568,6 +605,7 @@ def main():
         causal=causal,
         mask_value=None,
         debug=debug,
+        score_fn=jax_score
     )
 
     # correctness check
@@ -588,6 +626,7 @@ def main():
       block_k_major=block_k_major,
       block_k=block_k,
       causal=causal,
+      score_fn=jax_score
     )
     print("\nSummary:", results)
 
