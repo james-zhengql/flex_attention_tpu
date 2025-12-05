@@ -623,16 +623,16 @@ def _flash_attention_impl(
     return (batch_index, head_index, q_seq_index, 0)
 
   def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
-    if causal:
+    # if causal:
       # If the kv block is skipped, prefetch the next valid kv block, i.e. the
       # 0th one to be used for the next block_q rows.
-      next_kv_index = lax.select(
-          below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k_major),
-          kv_seq_index,
-          0,
-      )
-    else:
-      next_kv_index = kv_seq_index
+    #   next_kv_index = lax.select(
+    #       below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k_major),
+    #       kv_seq_index,
+    #       0,
+    #   )
+    # else:
+    next_kv_index = kv_seq_index
     return (batch_index, head_index, next_kv_index, 0)
 
   def ab_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
@@ -733,7 +733,7 @@ def _flash_attention_impl(
     )
 
     q_segment_ids = jax.lax.broadcast_in_dim(
-        segment_ids.q,
+        segment_ids,
         (batch_size, q_seq_len, NUM_LANES),
         (
             0,
@@ -741,7 +741,7 @@ def _flash_attention_impl(
         ),
     )
     kv_segment_ids = jax.lax.broadcast_in_dim(
-        segment_ids.kv,
+        segment_ids,
         (batch_size, NUM_SUBLANES, kv_seq_len),
         (
             0,
@@ -1502,7 +1502,7 @@ def mha_reference_no_custom_vjp(
 
   mask = None
   if segment_ids is not None:
-    mask = segment_ids.q[:, :, None] == segment_ids.kv[:, None, :]
+    mask = segment_ids[:, :, None] == segment_ids[:, None, :]
     mask = mask[:, None, :, :]
 
   if causal:

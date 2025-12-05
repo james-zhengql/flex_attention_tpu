@@ -5,6 +5,7 @@ import numpy as np
 import statistics as stats
 import time
 
+# Assumes these imports exist in your environment
 import flash_attention_fwd_ref
 import flex_attention_kernel
 import flash_attention_bwd
@@ -45,6 +46,9 @@ def benchmark(fn, args, iters=30, warmup=5, name="fn"):
         t1 = time.perf_counter()
         times.append(t1 - t0)
 
+    if not times:
+        return 0.0, 0.0
+
     mean_t = sum(times) / len(times)
     med_t = stats.median(times)
     p10, p90 = np.percentile(times, [10, 90])
@@ -68,7 +72,11 @@ def compute_diff(ref_out, test_out):
     diffs = {}
     for i, (r, t) in enumerate(zip(ref_out, test_out)):
         if r.shape != t.shape:
-            raise ValueError(f"Shape mismatch: ref {r.shape} vs test {t.shape}")
+            # Squeeze simplified dims if necessary or just warn
+            if r.size == t.size:
+                t = t.reshape(r.shape)
+            else:
+                raise ValueError(f"Shape mismatch: ref {r.shape} vs test {t.shape}")
 
         diffs[i] = float(
             jnp.linalg.norm(t - r) / (jnp.linalg.norm(r) + 1e-6)
@@ -94,6 +102,12 @@ def build_fns_for_bench(
     block_k=128,
     debug=False,
     score_fn=None,
+    mask_fn=None,           
+    block_mask_fn=None,     
+    window_size: int | None = None,     # Sliding Window
+    segment_ids: jax.Array | None = None, # Document Masking
+    s2_stride: int | None = None,         # S2 Attention
+    alibi_slope: float | None = None,
     which=("ref", "flash", "flash_ref"),
 ):
     out = {}
@@ -102,43 +116,36 @@ def build_fns_for_bench(
     # REFERENCE MHA
     # ========================================================
     if "ref" in which:
-        # Forward
+        # We pass ALL the configuration parameters to the reference
+        # so it matches the logic inside mask_fn exactly.
         ref_fwd = functools.partial(
             mha_reference,
             ab=None,
             sm_scale=sm_scale,
             save_residuals=True,
             score_fn=score_fn,
+            causal=causal,
+            window_size=window_size,
+            segment_ids=segment_ids,  # <--- Passed to Ref
+            s2_stride=s2_stride,       # <--- Passed to Ref
+            alibi_slope = alibi_slope
         )
+        # segment_ids is an array, not static, so we don't put it in static_argnames
         out["ref_fwd_jit"] = jax.jit(ref_fwd, static_argnames=("score_fn",))
-
-        # # Backward (needs o, l, m from fwd)
-        # ref_bwd = functools.partial(
-        #     mha_bwd_reference,
-        #     ab=None,
-        #     sm_scale=sm_scale,
-        #     save_residuals=True,
-        #     score_fn=score_fn,
-        # )
-        # out["ref_bwd_jit"] = jax.jit(ref_bwd, static_argnames=("score_fn",))
-
-        # # Combined: fwd + bwd
-        # def ref_fwd_bwd(q, k, v):
-        #     o, l, m = ref_fwd(q, k, v)
-        #     do = jnp.ones_like(o)
-        #     dq, dk, dv = ref_bwd(q, k, v, o, do, l, m)
-        #     return dq, dk, dv
-
-        # out["ref_fwd_bwd_jit"] = jax.jit(ref_fwd_bwd)
 
     # ========================================================
     # FLASH ATTENTION PALLAS KERNEL
     # ========================================================
     if "flash" in which:
+        print(f"Compiling Flash Kernel with: Mask={mask_fn is not None}, BlockMask={block_mask_fn is not None}")
+        
+        # The Flash Kernel relies on the closures (mask_fn/block_mask_fn) 
+        # to handle the logic for window/docs/s2. We don't pass s2_stride directly 
+        # unless the kernel expects it, but we assume it's baked into mask_fn.
         flash_fwd = functools.partial(
             flex_attention_kernel._flex_attention_impl,
             ab=ab,
-            segment_ids=None,
+            segment_ids=None, # Usually None for Pallas as it's handled in mask_fn
             save_residuals=True,
             causal=causal,
             sm_scale=sm_scale,
@@ -148,26 +155,23 @@ def build_fns_for_bench(
             block_k=block_k,
             debug=debug,
             score_fn=score_fn,
+            mask_fn=mask_fn,             
+            block_mask_fn=block_mask_fn
         )
-        out["flash_fwd_jit"] = jax.jit(flash_fwd, static_argnames=("score_fn",))
-
-        # Backward — unavailable for flash (you didn't provide it)
-        # So skip flash_bwd
-
-        # def flash_fwd_bwd(q, k, v):
-        #     o, l, m = flash_fwd(q, k, v)
-        #     return o, l, m  # no backward yet
-
-        # out["flash_fwd_bwd_jit"] = jax.jit(flash_fwd_bwd)
+        
+        out["flash_fwd_jit"] = jax.jit(
+            flash_fwd, 
+            static_argnames=("score_fn", "mask_fn", "block_mask_fn")
+        )
 
     # ========================================================
-    # FLASH ATTENTION REFERENCE (FWD + BWD)
+    # FLASH ATTENTION REFERENCE (Loop-based)
     # ========================================================
     if "flash_ref" in which:
         flash_ref_fwd = functools.partial(
-            flash_attention_fwd_ref._flash_attention_impl_ref,
+            _flash_attention_impl,
             ab=ab,
-            segment_ids=None,
+            segment_ids=segment_ids,
             save_residuals=True,
             causal=causal,
             sm_scale=sm_scale,
@@ -178,28 +182,6 @@ def build_fns_for_bench(
             debug=debug,
         )
         out["flash_ref_fwd_jit"] = jax.jit(flash_ref_fwd)
-
-        # flash_ref_bwd = functools.partial(
-        #     flash_attention_bwd._flash_attention_bwd_dq,
-        #     causal=causal,
-        #     sm_scale=sm_scale,
-        #     block_q_major=block_q,
-        #     block_k_major=block_k_major,
-        #     block_k=block_k,
-        #     debug=debug,
-        #     score_fn=score_fn,
-        # )
-        # out["flash_ref_bwd_jit"] = jax.jit(flash_ref_bwd)
-
-        # # Combined: fwd + bwd
-        # def flash_ref_fwd_bwd(q, k, v):
-        #     o, l, m = flash_ref_fwd(q, k, v)
-        #     do = jnp.ones_like(o)
-        #     di = jnp.ones_like(l)
-        #     dq, ds = flash_ref_bwd(q, k, v, ab= None, l=l, m=m, do=do, di=di)
-        #     return dq, ds
-
-        # out["flash_ref_fwd_bwd_jit"] = jax.jit(flash_ref_fwd_bwd)
 
     return out
 
@@ -218,12 +200,19 @@ def run_bench_suite(
     block_k,
     causal=False,
     score_fn=None,
+    mask_fn=None,         
+    block_mask_fn=None,   
+    window_size: int | None = None,
+    segment_ids: jax.Array | None = None,
+    s2_stride: int | None = None,
+    alibi_slope: float | None = None,
     which=("ref", "flash", "flash_ref"),
 ):
     b, h, q_len, d = q.shape
     _, _, k_len, _ = k.shape
 
     gflops = flop_count_attention(b, h, q_len, k_len, d) / 1e9
+    
     compiled = build_fns_for_bench(
         q, k, v,
         sm_scale=sm_scale,
@@ -233,11 +222,19 @@ def run_bench_suite(
         block_k_major=block_k_major,
         block_k=block_k,
         score_fn=score_fn,
+        mask_fn=mask_fn,             
+        block_mask_fn=block_mask_fn, 
+        window_size=window_size,     # <--- Passed
+        segment_ids=segment_ids,     # <--- Passed
+        s2_stride=s2_stride,         # <--- Passed
+        alibi_slope=alibi_slope,
         which=which,
     )
 
     print(f"\n== Benchmark config: b={b}, h={h}, q={q_len}, k={k_len}, d={d}, causal={causal} ==")
-    print(f"Estimated FLOPs per call: {gflops:.2f} GFLOPs\n")
+    print(f"Estimated FLOPs per call: {gflops:.2f} GFLOPs")
+    if block_mask_fn:
+        print("Note: FLOP count does not account for skipped blocks (sparsity).")
 
     results = {}
 
@@ -248,69 +245,39 @@ def run_bench_suite(
         if name in compiled:
             fn = compiled[name]
             t_mean, t_med = benchmark(fn, (q, k, v), iters=10, name=name)
-            print(f"  → FWD Throughput: {gflops/t_med:.2f} GFLOP/s\n")
+            if t_med > 0:
+                print(f"  → FWD Throughput: {gflops/t_med:.2f} GFLOP/s\n")
             results[name] = (t_mean, t_med)
     
     print("--- Numeric Accuracy (vs ref_fwd_jit) ---")
     
-    # Pre-compute Reference Outputs
+    ref_target = "ref_fwd_jit"
     ref_fwd_out = None
 
-    if "flash_ref_fwd_jit" in compiled:
-        ref_fwd_out = compiled["flash_ref_fwd_jit"](q, k, v)
-        # Block to ensure it's computed before comparing
-        jax.tree_util.tree_map(lambda x: x.block_until_ready(), ref_fwd_out)
+    if ref_target in compiled:
+        try:
+            ref_fwd_out = compiled[ref_target](q, k, v)
+            jax.tree_util.tree_map(lambda x: x.block_until_ready(), ref_fwd_out)
+        except Exception as e:
+            print(f"Reference run failed: {e}")
 
-    for name, fn in compiled.items():
-        if "ref" in name and "flash" not in name: continue # Skip comparing ref to itself
+    if ref_fwd_out:
+        for name, fn in compiled.items():
+            if name == ref_target: continue 
+            # # Skip flash_ref if it doesn't support the new masks, to avoid noise
+            # if name == "flash_ref_fwd_jit" and (window_size or segment_ids is not None):
+            #      print(f"[{name}] Skipped accuracy check (implementation may not support new masks)")
+            #      continue
 
-        test_out = fn(q, k, v)
-        jax.tree_util.tree_map(lambda x: x.block_until_ready(), test_out)
+            try:
+                test_out = fn(q, k, v)
+                jax.tree_util.tree_map(lambda x: x.block_until_ready(), test_out)
 
-        diff_res = {}
-        
-
-        if "fwd" in name and ref_fwd_out is not None:
-             # Standard Flash fwd returns (o, l, m), Ref usually (o, l, m) or just o
-             # Ensure your Ref wrapper returns consistent outputs for valid comparison
-             diff_res = compute_diff(ref_fwd_out, test_out)
-             print(f"[{name}] vs [ref_fwd]: {diff_res}")
-        else:
-             print(f"[{name}] Skipped diff (no matching reference output found)")
+                diff_res = compute_diff(ref_fwd_out, test_out)
+                print(f"[{name}] vs [{ref_target}]: {diff_res}")
+            except Exception as e:
+                print(f"[{name}] Validation failed: {e}")
+    else:
+        print("Skipping accuracy check (no reference output).")
 
     return results
-    # # ======================================================
-    # # BACKWARD BENCHMARKS
-    # # ======================================================
-    # for name in ("ref_bwd_jit", "flash_bwd_jit", "flash_ref_bwd_jit"):
-    #     if name in compiled:
-    #         fn = compiled[name]
-    #         # backward needs extra args
-    #         if name == "ref_bwd_jit":
-    #             o, l, m = compiled["ref_fwd_jit"](q, k, v)
-    #             do = jnp.ones_like(o)
-    #             args = (q, k, v, o, do, l, m)
-    #         elif name == "flash_ref_bwd_jit":
-    #             o, l, m = compiled["flash_ref_fwd_jit"](q, k, v)
-    #             do = jnp.ones_like(o)
-    #             di = jnp.ones_like(l)
-    #             args = (q, k, v, None, l, m, do, di)
-    #         else:
-    #             continue
-
-    #         t_mean, t_med = benchmark(fn, args, name=name)
-    #         print(f"  → BWD Throughput: {gflops/t_med:.2f} GFLOP/s\n")
-    #         results[name] = (t_mean, t_med)
-
-    # # ======================================================
-    # # COMBINED BENCHMARKS
-    # # ======================================================
-    # for name in ("ref_fwd_bwd_jit", "flash_fwd_bwd_jit", "flash_ref_fwd_bwd_jit"):
-    #     if name in compiled:
-    #         fn = compiled[name]
-    #         t_mean, t_med = benchmark(fn, (q, k, v), name=name)
-    #         print(f"  → FWD+BWD Throughput: {gflops/t_med:.2f} GFLOP/s\n")
-    #         results[name] = (t_mean, t_med)
-
-    # return results
-

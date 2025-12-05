@@ -12,13 +12,47 @@ from jax._src.util import safe_map
 from constants import dimension_numbers, MIN_BLOCK_SIZE
 
 
+def _inline_jaxpr_score(q, k, closed_jaxpr):
+  jaxpr = closed_jaxpr.jaxpr
+  literals = closed_jaxpr.literals
+  env = {}
 
-def _flash_attention_kernel(q_tile_ref, *args, score_jaxpr=None, **kwargs):
+  def read(var):
+      if isinstance(var, core.Literal):
+          return var.val
+      return env[var]
+
+  def write(var, val):
+      if not hasattr(val, 'dtype'):
+          val = jnp.asarray(val)
+      env[var] = val
+
+  write(jaxpr.invars[0], q)
+  write(jaxpr.invars[1], k)
+  for var, val in zip(jaxpr.constvars, literals):
+      write(var, val)
+
+  for eqn in jaxpr.eqns:
+      invals = [read(v) for v in eqn.invars]
+      outvals = eqn.primitive.bind(*invals, **eqn.params)
+      if not eqn.outvars:
+          continue
+      if eqn.primitive.multiple_results:
+          for var, val in zip(eqn.outvars, outvals):
+              write(var, val)
+      else:
+          write(eqn.outvars[0], outvals)
+
+  return read(jaxpr.outvars[0])
+
+def _flash_attention_kernel(q_tile_ref, *args, score_jaxpr=None,mask_fn=None,block_mask_fn=None, **kwargs):
     """Connects _flash_attention_impl to the generated kernel."""
     block_b = q_tile_ref.shape[0]
 
     kernel = make_flash_attention_kernel(
         score_jaxpr=score_jaxpr,
+        mask_fn=mask_fn,
+        block_mask_fn=block_mask_fn
     )
 
     for batch_idx in range(block_b):
@@ -28,8 +62,6 @@ def _flash_attention_kernel(q_tile_ref, *args, score_jaxpr=None, **kwargs):
             *args,
             **kwargs,
         )
-
-
 
 def _flex_attention_impl(
     q,
@@ -45,6 +77,8 @@ def _flex_attention_impl(
     block_k_major,
     block_k,
     debug,
+    block_mask_fn,
+    mask_fn,
     score_fn,
 ):
   batch_size, num_heads, q_seq_len, head_dim = q.shape
@@ -61,7 +95,14 @@ def _flex_attention_impl(
     return (batch_index, head_index, q_seq_index, 0)
 
   def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
-    next_kv_index = kv_seq_index
+    if block_mask_fn is not None:
+      next_kv_index = jax.lax.select(
+          block_mask_fn(q_seq_index, kv_seq_index),
+          kv_seq_index,
+          0,
+      )
+    else:
+      next_kv_index = kv_seq_index
     return (batch_index, head_index, next_kv_index, 0)
 
   def ab_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
@@ -91,7 +132,10 @@ def _flex_attention_impl(
       block_k=block_k,
       kv_seq_len=kv_seq_len,
       score_jaxpr=score_fn,
+      block_mask_fn=block_mask_fn,
+      mask_fn=mask_fn
   )
+
 
   out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
   out_shape = [out_shape]
@@ -156,7 +200,7 @@ def _flex_attention_impl(
     return o
   
 
-def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
+def make_flash_attention_kernel(mask_fn=None, block_mask_fn=None, score_jaxpr=None):
   """Factory returning a kernel with an optional custom mask function."""
   def flash_attention_fwd_kernel(
       batch_idx,
@@ -190,8 +234,10 @@ def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
       O_scratch_ref[batch_idx] = jnp.zeros(
           O_scratch_ref.shape[2:], jnp.float32)
 
-    if mask_fn is None:
+    if block_mask_fn is None:
       should_run = True
+    else:
+      should_run = block_mask_fn(q_seq_idx, kv_seq_idx)
 
     @pl.when(should_run)
     def body():
@@ -202,39 +248,8 @@ def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
         O_past = O_scratch_ref[batch_idx]
         k_ref = k_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
         q_ref = q_tile_ref[batch_idx]
-
-        def _inline_jaxpr_score(q, k, closed_jaxpr):
-          jaxpr = closed_jaxpr.jaxpr
-          literals = closed_jaxpr.literals
-          env = {}
-
-          def read(var):
-              if isinstance(var, core.Literal):
-                  return var.val
-              return env[var]
-
-          def write(var, val):
-              if not hasattr(val, 'dtype'):
-                  val = jnp.asarray(val)
-              env[var] = val
-
-          write(jaxpr.invars[0], q)
-          write(jaxpr.invars[1], k)
-          for var, val in zip(jaxpr.constvars, literals):
-              write(var, val)
-
-          for eqn in jaxpr.eqns:
-              invals = [read(v) for v in eqn.invars]
-              outvals = eqn.primitive.bind(*invals, **eqn.params)
-              if not eqn.outvars:
-                  continue
-              if eqn.primitive.multiple_results:
-                  for var, val in zip(eqn.outvars, outvals):
-                      write(var, val)
-              else:
-                  write(eqn.outvars[0], outvals)
-
-          return read(jaxpr.outvars[0])
+        block_q = q_ref.shape[0]
+        
 
         if score_jaxpr is None:
             S = jax.lax.dot_general(
@@ -245,10 +260,10 @@ def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
         else:
             S = score_jaxpr(q_ref, k_ref)
 
-        S = jax.lax.dot_general(
-                q_ref, k_ref, dimension_numbers,
-                preferred_element_type=jnp.float32
-            )
+        # S = jax.lax.dot_general(
+        #         q_ref, k_ref, dimension_numbers,
+        #         preferred_element_type=jnp.float32
+        #     )
 
         if ab_tile_ref is not None:
           ab = ab_tile_ref[
@@ -256,15 +271,27 @@ def make_flash_attention_kernel(mask_fn=None, score_jaxpr=None):
           ].astype(jnp.float32)
           S += ab
 
-        if causal:
-            q_start = q_seq_idx * q_ref.shape[0]  # block_q
-            k_start = kv_seq_idx * block_k_major + start_k
+        # if causal:
+        #     q_start = q_seq_idx * q_ref.shape[0]  # block_q
+        #     k_start = kv_seq_idx * block_k_major + start_k
 
-            q_pos = (q_start + jnp.arange(q_ref.shape[0]))[:, None]
-            k_pos = (k_start + jnp.arange(block_k))[None, :]
+        #     q_pos = (q_start + jnp.arange(q_ref.shape[0]))[:, None]
+        #     k_pos = (k_start + jnp.arange(block_k))[None, :]
 
-            causal_mask = k_pos > q_pos
-            S = jnp.where(causal_mask, -1e9, S)
+        #     causal_mask = k_pos > q_pos
+        #     S = jnp.where(causal_mask, -1e9, S)
+
+        if mask_fn is not None:
+          q_start = q_seq_idx * block_q
+          k_start_major = kv_seq_idx * block_k_major
+          k_start = k_start_major + start_k
+
+          q_pos = (q_start + jnp.arange(block_q, dtype=jnp.int32))  # [Bq]
+          k_pos = (k_start + jnp.arange(block_k, dtype=jnp.int32))  # [Bk]
+
+          token_keep_mask = mask_fn(q_pos, k_pos)  # [Bq, Bk] bool
+          # S = jnp.where(token_keep_mask, S, -1e9)
+          S = S + jnp.where(token_keep_mask, 0.0, -0.7 * float(jnp.finfo(jnp.dtype("float32")).max))
 
         m_cur = jnp.max(S, axis=1)[:, None]
         m_next = jnp.maximum(m_cur, m_past)

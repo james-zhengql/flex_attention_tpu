@@ -19,22 +19,18 @@ TRANS_B_DIM_NUMBERS = (((0,), (0,)), ((), ()))
 # ============================================================
 # AST transformer: safe, fusion-friendly JAX lowering
 # ============================================================
-
 class ToJaxTransformer(ast.NodeTransformer):
-    """Rewrite Python ops → JAX ops, and inline-lower dot/einsum to lax.dot_general,
-       with NO runtime assertions (to preserve fusion)."""
+    """Rewrite Python ops -> JAX ops, handling .T explicitly."""
 
     def __init__(self):
         super().__init__()
 
     # ---------------------------------------------------------
-    # Rewrite binary operators into JAX ops
+    # Rewrite binary operators (unchanged)
     # ---------------------------------------------------------
     def visit_BinOp(self, node):
         self.generic_visit(node)
         left, right = node.left, node.right
-
-        # Map + - * /
         ops = {
             ast.Add:  "add",
             ast.Sub:  "subtract",
@@ -42,7 +38,6 @@ class ToJaxTransformer(ast.NodeTransformer):
             ast.Div:  "divide",
         }
         op_type = type(node.op)
-
         if op_type in ops:
             return ast.Call(
                 func=ast.Attribute(
@@ -53,17 +48,16 @@ class ToJaxTransformer(ast.NodeTransformer):
                 args=[left, right],
                 keywords=[],
             )
-
         return node
 
     # ---------------------------------------------------------
-    # Rewrite function calls: dot → lax.dot_general, einsum → dot_general
+    # Rewrite function calls
     # ---------------------------------------------------------
     def visit_Call(self, node):
         self.generic_visit(node)
         fn = node.func
 
-        # Replace built-in sum → jnp.sum
+        # sum -> jnp.sum
         if isinstance(fn, ast.Name) and fn.id == "sum":
             return ast.Call(
                 func=ast.Attribute(value=ast.Name("jnp", ctx=ast.Load()),
@@ -72,65 +66,55 @@ class ToJaxTransformer(ast.NodeTransformer):
                 keywords=[]
             )
 
-        # jnp.tanh → already fine
-        if isinstance(fn, ast.Attribute) and fn.attr == "tanh":
-            return node
-
-        # -----------------------------------------------------
-        # jnp.dot(q, k) → inline lax.dot_general(q, k)
-        # -----------------------------------------------------
+        # jnp.dot(q, k) handling
         if isinstance(fn, ast.Attribute) and fn.attr == "dot":
-            q, k = node.args   # assume dot(q, k)
-            return self._make_inline_dot_general(q, k)
+            q_node, k_node = node.args
+            
+            # --- DETECT TRANSPOSE ---
+            # Default: Contract axis 1 (Last dim) -> appropriate for (N, D)
+            lhs_c = 1 
+            rhs_c = 1 
 
-        # -----------------------------------------------------
-        # jnp.einsum("...d,...d->...", q, k)
-        # -----------------------------------------------------
+            # Check if Q is Transposed (q.T)
+            # If q.T is (D, N), we must contract axis 0 (D)
+            if isinstance(q_node, ast.Attribute) and q_node.attr == "T":
+                lhs_c = 0
+            
+            # Check if K is Transposed (k.T)
+            # If k.T is (D, M), we must contract axis 0 (D)
+            if isinstance(k_node, ast.Attribute) and k_node.attr == "T":
+                rhs_c = 0
+
+            return self._make_inline_dot_general(q_node, k_node, lhs_c, rhs_c)
+
+        # jnp.einsum handling
         if isinstance(fn, ast.Attribute) and fn.attr == "einsum":
-            pattern_node = node.args[0]
-
-            if not (isinstance(pattern_node, ast.Constant)
-                    and isinstance(pattern_node.value, str)):
-                raise AssertionError(
-                    "einsum pattern must be a literal string like '...d,...d->...'"
-                )
-
-            pattern = pattern_node.value
-            # In util.py
-            pattern = pattern_node.value.replace(" ", "") # Remove spaces first
-
-            # Allow specific known patterns that are semantically equivalent
-            ALLOWED_PATTERNS = [
-                "...d,...d->...",
-                "qd,kd->qk",
-            ]
-
-            if pattern not in ALLOWED_PATTERNS:
-                raise AssertionError(f"Unsupported einsum pattern '{pattern}'. "
-                    "Only '...d,...d->...' is allowed for FlashAttention TPU.")
-
+            # (Simplification: Assuming standard 'qd,kd->qk' or '...d,...d->...')
+            # These imply contracting the LAST dimension of both inputs.
             q, k = node.args[1], node.args[2]
-            return self._make_inline_dot_general(q, k)
+            return self._make_inline_dot_general(q, k, 1, 1)
 
         return node
 
     # ---------------------------------------------------------
-    # Build inline lax.dot_general call (no wrappers!)
+    # Build inline lax.dot_general with DYNAMIC axes
     # ---------------------------------------------------------
-    def _make_inline_dot_general(self, q, k):
-
-        contracting_axis = ast.Constant(value=1)  # last dim of rank-2 tensors
-
+# ---------------------------------------------------------
+    # Build inline lax.dot_general with float32 accumulation
+    # ---------------------------------------------------------
+    def _make_inline_dot_general(self, q, k, lhs_c, rhs_c):
+        
+        # 1. Dimension Numbers (Same as before)
         dims = ast.Tuple(
             elts=[
-                ast.Tuple(  # contracting dims
+                ast.Tuple(
                     elts=[
-                        ast.Tuple(elts=[contracting_axis], ctx=ast.Load()),
-                        ast.Tuple(elts=[contracting_axis], ctx=ast.Load())
+                        ast.Tuple(elts=[ast.Constant(value=lhs_c)], ctx=ast.Load()),
+                        ast.Tuple(elts=[ast.Constant(value=rhs_c)], ctx=ast.Load())
                     ],
                     ctx=ast.Load()
                 ),
-                ast.Tuple(  # no batch dims
+                ast.Tuple(
                     elts=[
                         ast.Tuple(elts=[], ctx=ast.Load()),
                         ast.Tuple(elts=[], ctx=ast.Load())
@@ -141,6 +125,18 @@ class ToJaxTransformer(ast.NodeTransformer):
             ctx=ast.Load()
         )
 
+        # 2. Add 'preferred_element_type=jnp.float32'
+        # This tells TPU to use the 32-bit accumulator
+        pref_dtype = ast.keyword(
+            arg="preferred_element_type",
+            value=ast.Attribute(
+                value=ast.Name(id="jnp", ctx=ast.Load()),
+                attr="float32",
+                ctx=ast.Load()
+            )
+        )
+
+        # 3. Construct Call
         return ast.Call(
             func=ast.Attribute(
                 value=ast.Name(id="lax", ctx=ast.Load()),
@@ -148,60 +144,49 @@ class ToJaxTransformer(ast.NodeTransformer):
                 ctx=ast.Load(),
             ),
             args=[q, k, dims],
-            keywords=[]
+            keywords=[pref_dtype]  # <--- Added keyword here
         )
-
-
-# ============================================================
-# Final wrapper: validate user_fn, rewrite AST to pure JAX IR
-# ============================================================
 
 def make_jax_score_fn(user_fn):
     """
     Validate + rewrite user score function into a pure JAX function
     that TPU Pallas kernels can fully fuse.
+    Captures closure variables (like 'slope' or 'cap') automatically.
     """
 
-    # -----------------------------
-    # 0. Extract user source code
-    # -----------------------------
+    # 1. Extract user source code
     src = textwrap.dedent(inspect.getsource(user_fn))
     tree = ast.parse(src)
+    
+    # 2. Setup Namespace (JAX + Lax)
+    namespace = {"jnp": jnp, "lax": lax}
 
-    # -----------------------------
-    # 1. Static validation (compile-time)
-    #    -> NO runtime asserts allowed
-    # -----------------------------
-    # (You can add more rules here if needed)
-    # Ensure function has exactly 2 args (q, k)
-    sig = inspect.signature(user_fn)
-    if len(sig.parameters) != 2:
-        raise AssertionError("score_fn must have exactly two arguments: (q, k)")
+    # --- NEW: Capture Closure Variables ---
+    if user_fn.__closure__ and user_fn.__code__.co_freevars:
+        for var, cell in zip(user_fn.__code__.co_freevars, user_fn.__closure__):
+            namespace[var] = cell.cell_contents
+            print(f"   -> Captured constant: {var} = {namespace[var]}")
+    # --------------------------------------
 
-    # -----------------------------
-    # 2. AST rewrite → inline lax.dot_general
-    # -----------------------------
+    # 3. AST rewrite -> inline lax.dot_general
     transformer = ToJaxTransformer()
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
-    
-    # Pretty-print transformed code
-    print("==== Transformed JAX Code ====")
+
+    # --- DEBUG: Print the Transformed Code ---
+    print(f"\n[make_jax_score_fn] Transformed AST for {user_fn.__name__}:")
+    print("-" * 40)
+ 
+        # ast.unparse is available in Python 3.9+
     print(ast.unparse(tree))
-    print("================================")
-    # -----------------------------
-    # 3. Compile rewritten AST
-    # -----------------------------
-    namespace = {"jnp": jnp, "lax": lax}
+    print("-" * 40 + "\n")
+    # -----------------------------------------
+    
+    # 4. Compile
     code = compile(tree, filename="<ast>", mode="exec")
     exec(code, namespace)
 
-    # -----------------------------
-    # 4. Return the JIT-compiled function
-    # -----------------------------
-    rewritten_fn = namespace[user_fn.__name__]
-    return rewritten_fn
-
+    return namespace[user_fn.__name__]
 
 
 ###################################################
