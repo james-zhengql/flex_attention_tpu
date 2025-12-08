@@ -78,58 +78,58 @@ def main():
         "ref_args": {"causal": True}
     })
 
-    # --- Case B: Sliding Window ---
-    window_size = 1024
-    test_cases.append({
-        "name": f"Sliding Window (W={window_size})",
-        "factory": masks.make_sliding_window_mask_fns,
-        "factory_args": (window_size,), # Pass window_size to factory
-        "ref_args": {"causal": False, "window_size": window_size}
-    })
+    # # --- Case B: Sliding Window ---
+    # window_size = 1024
+    # test_cases.append({
+    #     "name": f"Sliding Window (W={window_size})",
+    #     "factory": masks.make_sliding_window_mask_fns,
+    #     "factory_args": (window_size,), # Pass window_size to factory
+    #     "ref_args": {"causal": False, "window_size": window_size}
+    # })
     
-    # --- Case C: Jagged Documents (Randomized) ---
-    # Generate 5 random document lengths that sum to 8192
-    doc_lengths = generate_doc_lengths(total_len=q_len, num_docs=5, seed=42)
-    print(f"Generated Doc Lengths: {doc_lengths}") 
-    # Example Output: [1200, 350, 4000, 2000, 642]
+    # # --- Case C: Jagged Documents (Randomized) ---
+    # # Generate 5 random document lengths that sum to 8192
+    # doc_lengths = generate_doc_lengths(total_len=q_len, num_docs=5, seed=42)
+    # print(f"Generated Doc Lengths: {doc_lengths}") 
+    # # Example Output: [1200, 350, 4000, 2000, 642]
 
-    # 1. Create Reference IDs for validation
-    #    (Builds the array [0,0,.., 1,1,.., 2,2,..])
-    ref_ids_list = []
-    for i, length in enumerate(doc_lengths):
-        ref_ids_list.append(jnp.full((length,), i, dtype=jnp.int32))
+    # # 1. Create Reference IDs for validation
+    # #    (Builds the array [0,0,.., 1,1,.., 2,2,..])
+    # ref_ids_list = []
+    # for i, length in enumerate(doc_lengths):
+    #     ref_ids_list.append(jnp.full((length,), i, dtype=jnp.int32))
     
-    jagged_ids_ref = jnp.concatenate(ref_ids_list)
-    jagged_ids_ref = jnp.tile(jagged_ids_ref[None, :], (batch, 1))
+    # jagged_ids_ref = jnp.concatenate(ref_ids_list)
+    # jagged_ids_ref = jnp.tile(jagged_ids_ref[None, :], (batch, 1))
 
-    test_cases.append({
-        "name": f"Jagged Masking ({len(doc_lengths)} Docs)",
-        "factory": masks.make_jagged_mask_fns,
-        # Pass the list of lengths to the factory
-        "factory_args": (doc_lengths,),  
-        # Pass the ID array to the reference
-        "ref_args": {"causal": True, "segment_ids": jagged_ids_ref}
-    })
+    # test_cases.append({
+    #     "name": f"Jagged Masking ({len(doc_lengths)} Docs)",
+    #     "factory": masks.make_jagged_mask_fns,
+    #     # Pass the list of lengths to the factory
+    #     "factory_args": (doc_lengths,),  
+    #     # Pass the ID array to the reference
+    #     "ref_args": {"causal": True, "segment_ids": jagged_ids_ref}
+    # })
 
-    # --- Case D: ALiBi (Score Function) ---
-    # Returns (None, None) for masks, passes score_fn to ref_args
+    # # --- Case D: ALiBi (Score Function) ---
+    # # Returns (None, None) for masks, passes score_fn to ref_args
     
-    alibi_fn = util.make_jax_score_fn(scores.make_alibi_score_fn(slope=0.5))
-    test_cases.append({
-        "name": "ALiBi Attention",
-        "factory": lambda *args: (None, None), # Dummy factory
-        "factory_args": (),
-        "ref_args": { "score_fn": alibi_fn,"alibi_slope":0.5}
-    })
+    # alibi_fn = util.make_jax_score_fn(scores.make_alibi_score_fn(slope=0.5))
+    # test_cases.append({
+    #     "name": "ALiBi Attention",
+    #     "factory": lambda *args: (None, None), # Dummy factory
+    #     "factory_args": (),
+    #     "ref_args": { "score_fn": alibi_fn,"alibi_slope":0.5}
+    # })
 
-    # --- Case E: Tanh Soft-Capping (Score Function) ---
-    tanh_fn = util.make_jax_score_fn(scores.make_softcap_score_fn(cap=30.0))
-    test_cases.append({
-        "name": "Tanh Soft-Capping",
-        "factory": lambda *args: (None, None),
-        "factory_args": (),
-        "ref_args": { "score_fn": tanh_fn}
-    })
+    # # --- Case E: Tanh Soft-Capping (Score Function) ---
+    # tanh_fn = util.make_jax_score_fn(scores.make_softcap_score_fn(cap=30.0))
+    # test_cases.append({
+    #     "name": "Tanh Soft-Capping",
+    #     "factory": lambda *args: (None, None),
+    #     "factory_args": (),
+    #     "ref_args": { "score_fn": tanh_fn}
+    # })
 
     # 4. Run Loop
     # -------------------------

@@ -399,14 +399,6 @@ def flash_attention_bwd_dkv(
     # else:
     #     scratch_shapes = []
 
-    if score_fn is not None:
-      score_jaxpr = jax.make_jaxpr(score_fn)(
-          jnp.zeros((block_q, head_dim), q.dtype),
-          jnp.zeros((block_k, head_dim), k.dtype),
-      )
-    else:
-        score_jaxpr = None
-
     kernel = functools.partial(
         flash_attention_dkv_kernel,
         causal = causal,
@@ -416,7 +408,7 @@ def flash_attention_bwd_dkv(
         q_seq_len = q_seq_len,
         block_q_major = block_q_major,
         block_k_major=block_k_major,
-        score_jaxpr= score_fn
+        score_fn= score_fn
         # block_b = block_b,
     )
 
@@ -463,32 +455,42 @@ def flash_attention_dkv_kernel(
       q_seq_len,
       block_q_major,
       block_k_major,
-      score_jaxpr
+      score_fn,
+      mask_fn,
+      block_mask_fn
   ):
 
     _, _, q_seq_length, _ = q_tile_ref.shape
+    # Grid: (Batch, Head, Major_K, Major_Q)
+    # program_id(2) -> Major K Index
+    # program_id(3) -> Major Q Index
     kv_tile_idx = pl.program_id(axis = 2)
     q_tile_idx = pl.program_id(axis = 3)
     
-    block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
-
-
+    # Initialization of scratch buffers
     @pl.when(q_tile_idx == 0)
     def start_new_kv_seq():
-        # dq_scratch_ref[:, :] = jnp.zeros(dq_scratch_ref.shape, dq_scratch_ref.dtype)
         dk_scratch_ref[:, :] = jnp.zeros(dk_scratch_ref.shape, dk_scratch_ref.dtype)
         dv_scratch_ref[:, :] = jnp.zeros(dv_scratch_ref.shape, dv_scratch_ref.dtype)
 
-    @pl.when(True)
+    # --- BLOCK MASK CHECK (OUTER) ---
+    if block_mask_fn is None:
+      should_run = True
+    else:
+      # We check once for the entire Major Q / Major K block pair
+      should_run = block_mask_fn(q_tile_idx, kv_tile_idx)
+      
+    @pl.when(should_run)
     def body():
       @pl.loop(0, block_q_major // block_q, unroll=True)
       def _body(j):
           start_q = j * block_q
-        # @pl.loop(0, q_seq_length, step=block_q, unroll=True)
-        # def _body(start_q):
+          
           @pl.loop(0, block_k_major // block_k, unroll=True)
           def _body(i):
             start_k = i * block_k
+            
+            # Load Data
             q  = q_tile_ref[0, 0, pl.dslice(start_q, block_q), :].astype(jnp.float32)
             dO = dO_tile_ref[0, 0, pl.dslice(start_q, block_q), :].astype(jnp.float32)
             di  = di_tile_ref[0, 0, pl.dslice(start_q, block_q), :].astype(jnp.float32)
@@ -496,56 +498,67 @@ def flash_attention_dkv_kernel(
             m  = m_tile_ref[0, 0, pl.dslice(start_q, block_q), :].astype(jnp.float32)
             k = k_tile_ref[0, 0, pl.dslice(start_k, block_k), :].astype(jnp.float32)
             v = v_tile_ref[0, 0, pl.dslice(start_k, block_k), :].astype(jnp.float32)
-
             
             dk_past = dk_scratch_ref[pl.ds(start_k, block_k), :]
             dv_past = dv_scratch_ref[pl.ds(start_k, block_k), :]
                         
-            if score_jaxpr is not None:
-                S, score_grad_fn = jax.vjp(score_jaxpr, q, k)
+            # Forward Pass Recomputation
+            if score_fn is not None:
+                S, score_grad_fn = jax.vjp(score_fn, q, k)
             else:
                 S = jax.lax.dot_general(q, k, dimension_numbers, preferred_element_type=jnp.float32)
                 score_grad_fn = None
 
             S = S * sm_scale
-            # unnormalized = jnp.exp(S - m_block[:, None])
-            unnormalized = jnp.exp(S - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))   # (block_q, block_k)
-            P = unnormalized / pltpu.repeat(l, block_k // MIN_BLOCK_SIZE, axis=1)                 # (block_q, block_k)
+            
+            if ab_tile_ref is not None:
+                ab = ab_tile_ref[0, 0, pl.dslice(start_q, block_q), pl.dslice(start_k, block_k)]
+                S += ab.astype(jnp.float32)
 
-            # dv = dv_past + jnp.einsum('rb, rd->bd', P, dO)
-            dv = dv_past + jax.lax.dot_general(P,dO,TRANS_B_DIM_NUMBERS,preferred_element_type=jnp.float32)
-            # dv = dv_past + jnp.einsum("qk,qd->kd", P, dO)
+            # --- MASK APPLICATION (INNER) ---
+            if mask_fn is not None:
+                # Calculate absolute coordinates
+                q_off = q_tile_idx * block_q_major + start_q
+                k_off = kv_tile_idx * block_k_major + start_k
+                
+                q_pos = q_off + jnp.arange(block_q, dtype=jnp.int32)
+                k_pos = k_off + jnp.arange(block_k, dtype=jnp.int32)
+                
+                # Apply mask to Scores (S) before softmax
+                # S = S + mask_val
+                token_mask = mask_fn(q_pos, k_pos)
+                S = S + jnp.where(token_mask, 0.0, -0.7 * float(jnp.finfo(jnp.dtype("float32")).max))
 
+            unnormalized = jnp.exp(S - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))   
+            P = unnormalized / pltpu.repeat(l, block_k // MIN_BLOCK_SIZE, axis=1)                 
+
+            # Backward: dV
+            dv = dv_past + jax.lax.dot_general(P, dO, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
             dv_scratch_ref[pl.dslice(start_k, block_k), :] = dv.astype(dv_scratch_ref.dtype)
 
-            dP = jax.lax.dot_general(dO,v,dimension_numbers,preferred_element_type=jnp.float32)
+            # Backward: dP
+            dP = jax.lax.dot_general(dO, v, dimension_numbers, preferred_element_type=jnp.float32)
   
-            # print(f"di shape{di.shape}")
+            # Backward: dS
             dS = P * (dP - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1))
 
             if sm_scale != 1.0:
               dS = dS * sm_scale  
 
-            # --- CHANGE 2: Backward Pass using Saved Residuals ---
+            # Backward: dQ, dK
             if score_grad_fn is not None:
-              # This uses the residuals saved from step 1. 
-              # It's fused and efficient. 
-              # jax.vjp returns a tuple (dQ, dK)
               dq_update, dk_update = score_grad_fn(dS)
             else:
               dk_update = jax.lax.dot(dS.T.astype(dO.dtype), q, preferred_element_type=jnp.float32)
             
-            print(f"dk shape{dk_update.shape}")
             dk = dk_past + dk_update
-
             dk_scratch_ref[pl.dslice(start_k, block_k), :] = dk.astype(dk_scratch_ref.dtype)
 
-    
+    # Store results when we finish the last Q block for this K block
     @pl.when(q_tile_idx == q_seq_len // block_q_major - 1)
     def store_res():
       dv_tile_ref[0, 0, :, :] = dv_scratch_ref[...].astype(dv_tile_ref.dtype)
       dk_tile_ref[0, 0, :, :] = dk_scratch_ref[...].astype(dk_tile_ref.dtype)
-    
     # return flash_attention_dkv_kernel
 
 

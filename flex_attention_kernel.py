@@ -116,13 +116,6 @@ def _flex_attention_impl(
   def lm_index_map(batch_index, head_index, q_seq_index, _):
     return (batch_index, head_index, q_seq_index, 0)
 
-  if score_fn is not None:
-      score_jaxpr = jax.make_jaxpr(score_fn)(
-          jnp.zeros((block_q, head_dim), q.dtype),
-          jnp.zeros((block_k, head_dim), k.dtype),
-      )
-  else:
-      score_jaxpr = None
 
 
   kernel = functools.partial(
@@ -222,6 +215,7 @@ def make_flash_attention_kernel(mask_fn=None, block_mask_fn=None, score_jaxpr=No
   ):
     block_k_major = k_tile_ref.shape[2]
     head_dim = k_tile_ref.shape[3]
+    block_q = q_tile_ref.shape[2]
     kv_seq_idx = pl.program_id(3)
     q_seq_idx = pl.program_id(2)   
 
