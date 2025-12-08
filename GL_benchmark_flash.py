@@ -13,11 +13,9 @@ def bench_flash(b, h, q_len, k_len, d, causal=False, warmup=10, iters=30):
 
     fn = lambda q, k, v: flash_attention(q, k, v, causal)
 
-    # warmup
     for _ in range(warmup):
         fn(q, k, v).block_until_ready()
 
-    # real timing
     times = []
     for _ in range(iters):
         start = time.time()
@@ -34,7 +32,6 @@ def bench_flash(b, h, q_len, k_len, d, causal=False, warmup=10, iters=30):
 if __name__ == "__main__":
     print("Devices:", jax.devices())
 
-    # Example benchmark (you can change these!)
     bench_flash(
         b=1, h=4,
         q_len=2048, k_len=2048,
