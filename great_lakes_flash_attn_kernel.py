@@ -30,17 +30,13 @@ def flash_attention_backward(ctx, dout, causal=False):
     attn, q, k, v = ctx
     b, h, q_len, d = q.shape
 
-    # dV
     dv = jnp.einsum("bhqk,bhqd->bhkd", attn, dout)
 
-    # d(attn)
     datt = jnp.einsum("bhqd,bhkd->bhqk", dout, v)
 
-    # d softmax
     attn_dot = jnp.sum(attn * datt, axis=-1, keepdims=True)
     dlogits = attn * (datt - attn_dot)
 
-    # dQ, dK
     dq = jnp.einsum("bhqk,bhkd->bhqd", dlogits, k)
     dk = jnp.einsum("bhqk,bhqd->bhkd", dlogits, q)
 
