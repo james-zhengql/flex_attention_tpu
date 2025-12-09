@@ -11,279 +11,17 @@ import numpy as np
 import time
 import statistics as stats
 from jax import lax 
-from flash_attention_fwd_ref import _flash_attention_impl_ref
 from flex_attention_kernel import _flex_attention_impl
-from util import _inline_jaxpr_score_backward, make_jax_score_fn
+from mha_reference import mha_reference,mha_bwd_reference
+from util import make_jax_score_fn
+import scores
+import masks
+import pandas as pd
 
 dimension_numbers = (((1,), (1,)), ((), ()))
 MIN_BLOCK_SIZE = 128
 TRANS_B_DIM_NUMBERS = (((0,), (0,)), ((), ()))
 
-def _flash_attention_kernel(q_tile_ref, *args, **kwargs):
-    """Connects _flash_attention_impl to the generated kernel."""
-    block_b = q_tile_ref.shape[0]
-
-    # Create the real kernel from the factory
-    kernel = make_flash_attention_kernel()
-
-    for batch_idx in range(block_b):
-        kernel(
-            (batch_idx, 0),
-            q_tile_ref,
-            *args,
-            **kwargs,
-        )
-
-
-def _flash_attention_impl(
-    q,
-    k,
-    v,
-    ab,
-    segment_ids,
-    save_residuals,
-    causal,
-    sm_scale,
-    block_b,
-    block_q,
-    block_k_major,
-    block_k,
-    debug,
-):
-  batch_size, num_heads, q_seq_len, head_dim = q.shape
-  _, _, kv_seq_len, _ = k.shape
-
-  # Grid specification
-  grid = (
-      pl.cdiv(batch_size, block_b),
-      num_heads,
-      pl.cdiv(q_seq_len, block_q),
-      kv_seq_len // block_k_major,
-  )
-
-  def q_index_map(batch_index, head_index, q_seq_index, _):
-    return (batch_index, head_index, q_seq_index, 0)
-
-  def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
-    next_kv_index = kv_seq_index
-    return (batch_index, head_index, next_kv_index, 0)
-
-  def ab_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
-    next_q_index = q_seq_index
-    next_kv_index = kv_seq_index
-    return (batch_index, head_index, next_q_index, next_kv_index)
-
-  def o_index_map(batch_index, head_index, q_seq_index, _):
-    return (batch_index, head_index, q_seq_index, 0)
-
-  def lm_index_map(batch_index, head_index, q_seq_index, _):
-    return (batch_index, head_index, q_seq_index, 0)
-
-  kernel = functools.partial(
-      _flash_attention_kernel,
-      causal=causal,
-      sm_scale=sm_scale,
-      block_k=block_k,
-      kv_seq_len=kv_seq_len,
-      block_k_major=block_k_major
-  )
-
-  out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
-  out_shape = [out_shape]
-  out_specs = [pl.BlockSpec((block_b, 1, block_q, head_dim), o_index_map)]
-
-  # Allocate scratch buffers
-  if block_k != kv_seq_len:
-    m_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
-    l_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
-    acc_scratch = pltpu.VMEM((block_b, 1, block_q, head_dim), jnp.float32)
-    scratch_shapes = [m_scratch, l_scratch, acc_scratch]
-  else:
-    scratch_shapes = []
-
-  # Output specs
-  if save_residuals:
-    out_specs = [
-        *out_specs,
-        pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
-        pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
-    ]
-    l = jax.ShapeDtypeStruct(
-        (batch_size, num_heads, q_seq_len, MIN_BLOCK_SIZE), dtype=jnp.float32
-    )
-    m = jax.ShapeDtypeStruct(
-        (batch_size, num_heads, q_seq_len, MIN_BLOCK_SIZE), dtype=jnp.float32
-    )
-    out_shape = (*out_shape, l, m)
-  else:
-    out_specs = [*out_specs, None, None]
-    out_shape = (*out_shape, None, None)
-
-  ab_block_spec = (
-      pl.BlockSpec((block_b, 1, block_q, block_k_major), ab_index_map)
-      if ab is not None else None)
-
-  in_specs = [
-      pl.BlockSpec((block_b, 1, block_q, head_dim), q_index_map),
-      pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
-      pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
-      ab_block_spec,
-  ]
-
-  o, *aux = pl.pallas_call(
-      kernel,
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=0,
-          grid=grid,
-          in_specs=in_specs,
-          out_specs=out_specs,
-          scratch_shapes=scratch_shapes,
-      ),
-      out_shape=out_shape,
-      debug=debug,
-      compiler_params=pltpu.CompilerParams(
-          dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")
-      ),
-  )(q, k, v, ab)
-
-  if save_residuals:
-    l, m = (v[..., 0] for v in aux[-2:])
-    return (o, l, m)
-  else:
-    return o
-
-
-def mha_reference(
-    q,
-    k,
-    v,
-    ab: jax.Array | None = None,
-    *,
-    sm_scale: float = 1.0,
-    save_residuals: bool = False,
-):
-  logits = jnp.einsum("bhqc,bhkc->bhqk", q, k)
-  if ab is not None:
-    logits += ab
-  if sm_scale != 1.0:
-    logits *= sm_scale
-
-  # --- causal masking (disabled for now but can enable later)
-  mask = None
-  # if causal:
-  #   _, _, q_seq_len, _ = q.shape
-  #   _, _, kv_seq_len, _ = k.shape
-  #   mask_shape = (q_seq_len, kv_seq_len)
-  #   row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-  #   col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-  #   causal_mask = (col_ids <= row_ids)[None, None, :, :]
-  #   mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-
-  logits = logits if mask is None else logits + jnp.where(mask, 0.0, -1e9)
-
-  m = logits.max(axis=-1)
-  unnormalized = jnp.exp(logits - m[..., None])
-  l = unnormalized.sum(axis=-1)
-  weights = unnormalized / l[..., None]
-  out = jnp.einsum("bhqk,bhkc->bhqc", weights, v)
-  if save_residuals:
-    return out, l, m
-  return out
-
-
-def make_flash_attention_kernel(mask_fn=None):
-  """Factory returning a kernel with an optional custom mask function."""
-  def flash_attention_fwd_kernel(
-      batch_idx,
-      q_tile_ref,
-      k_tile_ref,
-      v_tile_ref,
-      ab_tile_ref,
-      O_tile_ref,
-      m_tile_ref,
-      l_tile_ref,
-      O_scratch_ref,
-      m_scratch_ref,
-      l_scratch_ref,
-      *,
-      causal,
-      sm_scale,
-      block_k,
-      kv_seq_len,
-      block_k_major,
-  ):
-    # block_k_major = 
-    head_dim = k_tile_ref.shape[-1]
-    # head_dim = 128
-    kv_seq_idx = pl.program_id(3)
-
-    @pl.when(kv_seq_idx == 0)
-    def start_new_seq():
-      m_scratch_ref[batch_idx] = jnp.full(
-          m_scratch_ref.shape[2:], -jnp.inf, jnp.float32)
-      l_scratch_ref[batch_idx] = jnp.zeros(
-          l_scratch_ref.shape[2:], jnp.float32)
-      O_scratch_ref[batch_idx] = jnp.zeros(
-          O_scratch_ref.shape[2:], jnp.float32)
-
-    if mask_fn is None:
-      should_run = True
-
-    @pl.when(should_run)
-    def body():
-    #   @pl.loop(0, block_k_major, step=block_k, unroll=True)
-    #   def _body(start_k):
-      @pl.loop(0, block_k_major // block_k, unroll = True)
-      def _body(i):
-        start_k = i * block_k
-        m_past = m_scratch_ref[batch_idx]
-        l_past = l_scratch_ref[batch_idx]
-        O_past = O_scratch_ref[batch_idx]
-        k_ref = k_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
-        q_ref = q_tile_ref[batch_idx]
-
-        S = jax.lax.dot_general(q_ref, k_ref, dimension_numbers, preferred_element_type=jnp.float32)
-        S *= sm_scale
-
-        if ab_tile_ref is not None:
-          ab = ab_tile_ref[
-              (*batch_idx, pl.dslice(None), pl.dslice(start_k, block_k))
-          ].astype(jnp.float32)
-          S += ab
-
-        m_cur = jnp.max(S, axis=1)[:, None]
-        m_next = jnp.maximum(m_cur, m_past)
-        block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
-        if rem:
-          raise NotImplementedError(f"{block_k=} should be a multiple of {MIN_BLOCK_SIZE}")
-
-        P = jnp.exp(S - pltpu.repeat(m_next, block_k_repeats, 1))
-        l_corr = jnp.exp(m_past - m_next) * l_past
-        l_next = l_corr + jnp.sum(P, axis=1)[:, None]
-
-        head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
-        if rem:
-          raise NotImplementedError(f"{head_dim=} should be a multiple of {MIN_BLOCK_SIZE} if larger")
-
-        l_broadcast = lambda l: pltpu.repeat(l, head_dim_repeats, 1)
-        l_scratch_ref[batch_idx] = l_next
-        m_scratch_ref[batch_idx] = m_next
-
-        l_next_inv_safe = jnp.where(l_next == 0.0, 1.0, 1.0 / l_next)
-        v_ref = v_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
-        o_curr = jax.lax.dot(P.astype(v_ref.dtype), v_ref, preferred_element_type=jnp.float32)
-        O_scratch_ref[batch_idx] = O_past * l_broadcast(l_corr) + o_curr
-        O_scratch_ref[batch_idx] *= l_broadcast(l_next_inv_safe)
-
-    @pl.when(kv_seq_idx == (kv_seq_len // block_k_major) - 1)
-    def store_res():
-      O_tile_ref[batch_idx] = O_scratch_ref[batch_idx].astype(O_tile_ref.dtype)
-      # Only store m/l if they were requested (i.e., not None)
-      if (m_tile_ref is not None) and (l_tile_ref is not None):
-        m_tile_ref[batch_idx] = m_scratch_ref[batch_idx].astype(m_tile_ref.dtype)
-        l_tile_ref[batch_idx] = l_scratch_ref[batch_idx].astype(l_tile_ref.dtype)
-
-  return flash_attention_fwd_kernel
 
 
 def flash_attention_bwd_dkv(
@@ -291,13 +29,11 @@ def flash_attention_bwd_dkv(
     v,
     q,
     ab,
-    segment_ids,
     l,
     m,
     di,
     do,
     *,
-    block_b,
     block_q,
     block_q_major: int | None,
     block_k_major: int | None,
@@ -306,7 +42,9 @@ def flash_attention_bwd_dkv(
     causal: bool,
     # mask_value: float,
     debug: bool,
-    score_fn = None
+    score_fn = None,
+    mask_fn = None,      # Added
+    block_mask_fn = None # Added
 ):
     batch_size, head_num, q_seq_len, head_dim = q.shape
     _, _, kv_seq_len, _ = k.shape
@@ -335,8 +73,16 @@ def flash_attention_bwd_dkv(
     do_spec = qo_spec
     assert do.ndim == len(qo_spec.block_shape)
 
-    def kv_index_map(batch_index, head_index, kv_seq_index, _ ):
-      return (batch_index, head_index, kv_seq_index, 0)
+    def kv_index_map(batch_index, head_index, kv_seq_index, q_seq_index):
+      if block_mask_fn is not None:
+        next_kv_index = jax.lax.select(
+            block_mask_fn(q_seq_index, kv_seq_index),
+            kv_seq_index,
+            0,
+        )
+      else:
+        next_kv_index = kv_seq_index
+      return (batch_index, head_index, next_kv_index, 0)
 
     kv_spec = pl.BlockSpec((1, 1, block_k_major, head_dim),  kv_index_map)
     assert kv_spec.block_shape is not None
@@ -408,8 +154,9 @@ def flash_attention_bwd_dkv(
         q_seq_len = q_seq_len,
         block_q_major = block_q_major,
         block_k_major=block_k_major,
-        score_fn= score_fn
-        # block_b = block_b,
+        score_fn= score_fn,
+        mask_fn=mask_fn,               
+        block_mask_fn=block_mask_fn    
     )
 
     # dq = jnp.zeros(dq_spec, jnp.float32)
@@ -562,117 +309,119 @@ def flash_attention_dkv_kernel(
     # return flash_attention_dkv_kernel
 
 
-def mha_reference_bwd(
-    q, 
-    k,
-    v, 
-    ab,
-    segment_ids: None,
-    o,
-    l,
-    m,
-    do,
-    causal: bool = False,
-    mask_value: float = None,
-    *,
-    sm_scale: float = 1.0, 
-):
+# def mha_reference_bwd(
+#     q, 
+#     k,
+#     v, 
+#     ab,
+#     segment_ids: None,
+#     o,
+#     l,
+#     m,
+#     do,
+#     causal: bool = False,
+#     mask_value: float = None,
+#     *,
+#     sm_scale: float = 1.0, 
+# ):
+#   if mask_value is None:
+#       mask_value = -1e9
 
-  logits = jnp.einsum(
-      "bhqc,bhkc->bhqk",
-      q.astype(jnp.float32),
-      k.astype(jnp.float32),
-  )
+#   logits = jnp.einsum(
+#       "bhqc,bhkc->bhqk",
+#       q.astype(jnp.float32),
+#       k.astype(jnp.float32),
+#   )
 
-  if sm_scale != 1.0:
-    logits *= sm_scale
+#   if sm_scale != 1.0:
+#     logits *= sm_scale
 
-  if ab is not None:
-    logits += ab
+#   if ab is not None:
+#     logits += ab
 
-  mask = None
-  if segment_ids is not None:
-    mask = segment_ids.q[:, :, None] == segment_ids.kv[:, None, :]
-    mask = mask[:, None, :, :]
+#   mask = None
+#   if segment_ids is not None:
+#     mask = segment_ids.q[:, :, None] == segment_ids.kv[:, None, :]
+#     mask = mask[:, None, :, :]
 
-  if causal:
-    _, _, q_seq_len, _ = q.shape
-    _, _, kv_seq_len, _ = k.shape
-    mask_shape = (q_seq_len, kv_seq_len)
-    row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-    col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-    causal_mask = (col_ids <= row_ids)[None, None, :, :]
-    mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+#   if causal:
+#     _, _, q_seq_len, _ = q.shape
+#     _, _, kv_seq_len, _ = k.shape
+#     mask_shape = (q_seq_len, kv_seq_len)
+#     row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+#     col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+#     causal_mask = (col_ids <= row_ids)[None, None, :, :]
+#     mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
 
-  logits = logits if mask is None else logits + jnp.where(mask, 0.0, mask_value)
-  # jax.debug.print("logits norm: {x:.3e}", x=jnp.linalg.norm(logits))
-  # jax.debug.print("logits - m norm: {x:.3e}", x=jnp.linalg.norm(logits - m[..., None]))
-  # jax.debug.print("mnorm: {x:.3e}", x=jnp.linalg.norm(m))
-  unnormalized = jnp.exp(logits - m[..., None])
-  # jax.debug.print("exp norm: {x:.3e}", x=jnp.linalg.norm(unnormalized))
-  p = unnormalized / l[..., None]
-  # jax.debug.print("p norm: {x:.3e}", x=jnp.linalg.norm(p))
+#   logits = logits if mask is None else logits + jnp.where(mask, 0.0, mask_value)
+#   # jax.debug.print("logits norm: {x:.3e}", x=jnp.linalg.norm(logits))
+#   # jax.debug.print("logits - m norm: {x:.3e}", x=jnp.linalg.norm(logits - m[..., None]))
+#   # jax.debug.print("mnorm: {x:.3e}", x=jnp.linalg.norm(m))
+#   unnormalized = jnp.exp(logits - m[..., None])
+#   # jax.debug.print("exp norm: {x:.3e}", x=jnp.linalg.norm(unnormalized))
+#   p = unnormalized / l[..., None]
+#   # jax.debug.print("p norm: {x:.3e}", x=jnp.linalg.norm(p))
 
-  dv = jnp.einsum("bhpt,bhpd->bhtd", p, do.astype(jnp.float32)).astype(v.dtype)
+#   dv = jnp.einsum("bhpt,bhpd->bhtd", p, do.astype(jnp.float32)).astype(v.dtype)
 
-  dp = jnp.einsum(
-      "bhpd,bhtd->bhpt", do.astype(jnp.float32), v.astype(jnp.float32)
-  )
-  # jax.debug.print("dp norm: {x:.3e}", x=jnp.linalg.norm(dp))
+#   dp = jnp.einsum(
+#       "bhpd,bhtd->bhpt", do.astype(jnp.float32), v.astype(jnp.float32)
+#   )
+#   # jax.debug.print("dp norm: {x:.3e}", x=jnp.linalg.norm(dp))
 
-  di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)[
-      ..., None
-  ]  # [batch_size, num_heads, q_seq_len]
+#   di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)[
+#       ..., None
+#   ]  # [batch_size, num_heads, q_seq_len]
 
-  ds = (dp - di) * p
-  # jax.debug.print("ds norm before scale: {x:.3e}", x=jnp.linalg.norm(ds))
-  ds = ds * sm_scale
-  # Requires: import jax
-  # jax.debug.print("ds norm: {x:.3e}", x=jnp.linalg.norm(ds))
+#   ds = (dp - di) * p
+#   # jax.debug.print("ds norm before scale: {x:.3e}", x=jnp.linalg.norm(ds))
+#   ds = ds * sm_scale
+#   # Requires: import jax
+#   # jax.debug.print("ds norm: {x:.3e}", x=jnp.linalg.norm(ds))
 
-  dk = jnp.einsum("bhsd,bhst->bhtd", q.astype(jnp.float32), ds).astype(k.dtype)
-  dq = jnp.einsum("bhst,bhtd->bhsd", ds, k.astype(jnp.float32)).astype(q.dtype)
+#   dk = jnp.einsum("bhsd,bhst->bhtd", q.astype(jnp.float32), ds).astype(k.dtype)
+#   dq = jnp.einsum("bhst,bhtd->bhsd", ds, k.astype(jnp.float32)).astype(q.dtype)
 
-  # dab is just ds
-  dab = ds if ab is not None else None
+#   # dab is just ds
+#   dab = ds if ab is not None else None
 
-  return dq, dk, dv, dab
+#   return dq, dk, dv, dab
 
 
-def _mha_reference_bwd(
-    q,
-    k,
-    v,
-    ab,
-    o,
-    l,
-    m,
-    do,
-    *,
-    segment_ids, 
-    causal: bool,
-    mask_value: float,
-    sm_scale: float,
-    save_residuals: bool,
+# def _mha_reference_bwd(
+#     q,
+#     k,
+#     v,
+#     ab,
+#     o,
+#     l,
+#     m,
+#     do,
+#     *,
+#     segment_ids, 
+#     causal: bool,
+#     mask_value: float,
+#     sm_scale: float,
+#     save_residuals: bool,
     
-):
-  # del save_residuals
-  # q, k, v, ab, segment_ids, o, l, m = residuals
-  dq, dk, dv, dab = mha_reference_bwd(
-      q,
-      k,
-      v,
-      ab,
-      segment_ids,
-      o,
-      l,
-      m,
-      do,
-      causal=causal,
-      mask_value=mask_value,
-      sm_scale=sm_scale,
-  )
-  return dq, dk, dv, dab, None
+# ):
+#   # del save_residuals
+#   # q, k, v, ab, segment_ids, o, l, m = residuals
+#   dq, dk, dv, dab = mha_bwd_reference(
+#       q,
+#       k,
+#       v,
+#       ab,
+#       segment_ids,
+#       o,
+#       l,
+#       m,
+#       do,
+#       causal=causal,
+#       mask_value=mask_value,
+#       sm_scale=sm_scale,
+#   )
+#   return dq, dk, dv, dab, None
 
 def flop_count_attention(b, h, q, k, d):
     """
@@ -723,10 +472,11 @@ def benchmark(fn, args, iters=30, warmup=5, name="fn"):
     return mean_t, med_t
 
 def build_fns_for_bench(
-    q, k, v, ab, segment_ids, o, l, m, di, do,
+    q, k, v,
+    l, m, o, do, di,
     *,
+    ab=None,
     sm_scale=1.0,
-    save_residuals=False,
     causal=False,
     block_b=1,
     block_q=128,
@@ -734,187 +484,599 @@ def build_fns_for_bench(
     block_k=128,
     debug=False,
     block_q_major=128,
-    score_fn = None
+    score_fn=None,
+    window_size=None,
+    segment_ids=None,
+    s2_stride=None,
+    alibi_slope=None,
+    mask_fn=None,
+    block_mask_fn=None,
 ):
-    # ---------- Reference backward ----------
+    """
+    Build JIT-ed reference and Pallas (flex) dK/dV backward fns.
+
+    - Reference: mha_bwd_reference(q, k, v, o, do, l, m, ...)
+      returns (dq_ref, dk_ref, dv_ref)
+    - Flex (Pallas): flash_attention_bwd_dkv(q, k, v, l, m, di, do, ...)
+      returns (dk_flex, dv_flex) or a tuple whose first two are dk, dv.
+    """
+
+    # ----------------- Reference backward -----------------
     ref_fn = functools.partial(
-        _mha_reference_bwd,
-        segment_ids=segment_ids,
-        causal=causal,
-        mask_value=None,
+        mha_bwd_reference,
+        ab=ab,
         sm_scale=sm_scale,
-        save_residuals=save_residuals,
+        score_fn=score_fn,
+        causal=causal,
+        window_size=window_size,
+        segment_ids=segment_ids,
+        s2_stride=s2_stride,
+        alibi_slope=alibi_slope,
     )
+    # Call as: ref_jit(q, k, v, o, do, l, m)
     ref_jit = jax.jit(ref_fn)
 
-    # ---------- Flash (Pallas) backward ----------
-    flash_partial = functools.partial(
+    # ----------------- FlexAttention backward (Pallas dK/dV) -----------------
+    # We treat the Pallas dK/dV kernel as "flex"
+    flex_partial = functools.partial(
         flash_attention_bwd_dkv,
         ab=ab,
-        segment_ids=segment_ids,
         causal=causal,
         sm_scale=sm_scale,
-        block_b=block_b,
         block_q=block_q,
         block_q_major=block_q_major,
         block_k_major=block_k_major,
         block_k=block_k,
         debug=debug,
-        score_fn = score_fn
+        score_fn=score_fn,
+        mask_fn=mask_fn,
+        block_mask_fn=block_mask_fn,
     )
 
-  
-    def flash_bwd_fn(q, k, v, l, m, di, do):
-        return flash_partial(q=q, k=k, v=v, l=l, m=m, di=di, do=do)
+    def flex_bwd_fn(q, k, v, l, m, di, do):
+        out = flex_partial(q=q, k=k, v=v, l=l, m=m, di=di, do=do)
+        # Normalize outputs to (dk, dv)
+        if isinstance(out, (tuple, list)):
+            # Assume (dk, dv, *rest) or just (dk, dv)
+            return out[0], out[1]
+        # If kernel returns a single packed tensor, you can change this as needed
+        return out
 
-    flash_jit = jax.jit(flash_bwd_fn)
+    flex_jit = jax.jit(flex_bwd_fn)
 
-    return ref_jit, flash_jit
+    return ref_jit, flex_jit
+
+
 def run_bench_suite(
-    q, k, v, ab, segment_ids, o, l, m, di, do,
+    q, k, v, l, m, o, do, di,
     *,
     sm_scale,
     block_b,
     block_q,
     block_k_major,
-    block_k,
     block_q_major,
+    block_k,
     causal=False,
-    score_fn=None
+    score_fn=None,
+    window_size=None,
+    segment_ids=None,
+    s2_stride=None,
+    alibi_slope=None,
+    mask_fn=None,
+    block_mask_fn=None,
+    ab=None,
+    debug=False,
 ):
-    # Unpack shapes
-    b, h, q_len, d = q.shape
+    b, h, q_len, h_d = q.shape
     _, _, k_len, _ = k.shape
 
-    gflops = flop_count_attention(b, h, q_len, k_len, d) / 1e9
+    gflops = flop_count_attention(b, h, q_len, k_len, h_d) / 1e9
 
-    ref_jit, flash_jit = build_fns_for_bench(
-        q, k, v, ab, segment_ids, o, l, m, di, do,
+    ref_jit, flex_jit = build_fns_for_bench(
+        q, k, v,
+        l, m, o, do, di,
+        ab=ab,
         sm_scale=sm_scale,
-        save_residuals=False,
         causal=causal,
         block_b=block_b,
         block_q=block_q,
         block_k_major=block_k_major,
         block_k=block_k,
-        debug=False,
         block_q_major=block_q_major,
-        score_fn=score_fn
+        debug=debug,
+        score_fn=score_fn,
+        window_size=window_size,
+        segment_ids=segment_ids,
+        s2_stride=s2_stride,
+        alibi_slope=alibi_slope,
+        mask_fn=mask_fn,
+        block_mask_fn=block_mask_fn,
     )
 
-    print(f"\n== Benchmark config: b={b}, h={h}, q={q_len}, k={k_len}, d={d}, causal={causal} ==")
+    print(f"\n== Benchmark config (dK/dV): "
+          f"b={b}, h={h}, q={q_len}, k={k_len}, d={h_d}, causal={causal} ==")
     print(f"Estimated FLOPs per call: {gflops:.2f} GFLOPs")
 
-    # ---------- Reference backward ----------
+    # ----------------- Reference timing -----------------
     t_mean_ref, t_med_ref = benchmark(
-        ref_jit, (q, k, v, ab, o, l, m, do),
-        name="mha_reference_bwd[jit]",
+        ref_jit,
+        (q, k, v, o, do, l, m),          # (q, k, v, o, do, l, m)
+        name="mha_reference_bwd_dkv[jit]",
     )
-    print(f"  → Throughput: {gflops / t_med_ref:.2f} GFLOP/s")
+    print(f"  → Reference throughput: {gflops / t_med_ref:.2f} GFLOP/s")
 
-    # ---------- Flash (Pallas) backward ----------
-    t_mean_flash, t_med_flash = benchmark(
-        flash_jit, (q, k, v, l, m, di, do),
-        name="pallas_flash_bwd_dkv[jit]",
+    # ----------------- Flex (Pallas dK/dV) timing -----------------
+    t_mean_flex, t_med_flex = benchmark(
+        flex_jit,
+        (q, k, v, l, m, di, do),         # (q, k, v, l, m, di, do)
+        name="flex_bwd_dkv[jit]",
     )
-    print(f"  → Throughput: {gflops / t_med_flash:.2f} GFLOP/s")
+    print(f"  → Flex throughput:      {gflops / t_med_flex:.2f} GFLOP/s")
 
-    # ---------- Numeric correctness check ----------
-    dq_ref, dk_ref, dv_ref, dab_ref, _ = ref_jit(q, k, v, ab, o, l, m, do)
-    dk_out, dv_out = flash_jit(q, k, v, l, m, di, do)
+    # ----------------- Numeric correctness -----------------
+    dq_ref, dk_ref, dv_ref = ref_jit(q, k, v, o, do, l, m)
+    dk_ref = dk_ref.block_until_ready()
+    dv_ref = dv_ref.block_until_ready()
 
-    # block_until_ready
-    dq_ref.block_until_ready()
-    dk_ref.block_until_ready()
-    dv_ref.block_until_ready()
-    dk_out.block_until_ready()
-    dv_out.block_until_ready()
+    dk_flex, dv_flex = flex_jit(q, k, v, l, m, di, do)
+    dk_flex = dk_flex.block_until_ready()
+    dv_flex = dv_flex.block_until_ready()
 
-    rel_dk = jnp.linalg.norm(dk_out - dk_ref) /jnp.linalg.norm(dk_ref)
-    rel_dv = jnp.linalg.norm(dv_out - dv_ref) / jnp.linalg.norm(dv_ref)
-    # print(f"Numeric dk diff (Relative L2): {rel_dk:.3e}")
-    # print(f"ref: {jnp.linalg.norm(dk_ref):.3e}")
-    # print(f"Numeric dv diff (Relative L2): {rel_dv:.3e}")
+    rel_err_dk = jnp.linalg.norm(dk_flex - dk_ref) / (jnp.linalg.norm(dk_ref) + 1e-6)
+    rel_err_dv = jnp.linalg.norm(dv_flex - dv_ref) / (jnp.linalg.norm(dv_ref) + 1e-6)
+
+    rel_err_dk_f = float(rel_err_dk)
+    rel_err_dv_f = float(rel_err_dv)
+
+    print(f"Numeric diff Flex vs Ref (Relative L2) dK: {rel_err_dk_f:.3e}")
+    print(f"Numeric diff Flex vs Ref (Relative L2) dV: {rel_err_dv_f:.3e}")
 
     return {
         "ref_ms_med": t_med_ref * 1e3,
-        "flash_ms_med": t_med_flash * 1e3,
+        "flex_ms_med": t_med_flex * 1e3,
         "ref_gflops": gflops / t_med_ref,
-        "flash_gflops": gflops / t_med_flash,
-        "rel_l2_dk": float(rel_dk),
-        "rel_l2_dv": float(rel_dv),
+        "flex_gflops": gflops / t_med_flex,
+        "rel_l2_dk": rel_err_dk_f,
+        "rel_l2_dv": rel_err_dv_f,
     }
 
+
+
+# def main():
+#   key = jax.random.PRNGKey(0)
+#   batch = 1
+#   heads = 1
+#   q_len = 20480 # Reduced for quick testing, increase to 12800 for real bench
+#   kv_len = 20480
+#   head_dim = 128
+
+#   k1, k2, k3, k4 = jax.random.split(key, 4)
+#   q = jax.random.normal(k1, (batch, heads, q_len, head_dim), dtype=jnp.float32)
+#   k = jax.random.normal(k2, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
+#   v = jax.random.normal(k3, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
+#   do = jax.random.normal(k4, (batch, heads, q_len, head_dim), dtype=jnp.float32)
+#   ab = None
+#   segment_ids = None
+
+#   block_b = 1
+#   block_q_major = 1024
+#   block_q = 1024
+#   block_k_major = 1024
+#   block_k = 1024
+
+#   causal = False # Example: Enable Causal
+#   sm_scale = 1.0
+#   debug = False
+#   save_residuals = True
+
+#   # --- Define Custom Mask Functions ---
+#   # Example: Causal Mask Logic
+#   def causal_mask_fn(q_idx, k_idx):
+#       return q_idx[:,None] >= k_idx[None,:] # True means "Mask out" (drop), False means keep
+  
+#   def causal_block_mask_fn(q_block_idx, k_block_idx):
+#       # Calculate global token indices for the blocks
+#       # q_start = q_block_idx * block_q # If using fine-grained
+#       # k_start = k_block_idx * block_k
+      
+#       # Using Major blocks:
+#       q_end_token = (q_block_idx + 1) * block_q_major - 1
+#       k_start_token = k_block_idx * block_k_major
+      
+#       # If the start of the K block is strictly after the end of the Q block,
+#       # the entire block is masked (future).
+#       return k_start_token <= q_end_token # Return TRUE if we SHOULD run
+
+#   # If causal=True is passed to kernels, they often have built-in logic.
+#   # But here we pass explicit functions to test the new plumbing.
+#   mask_fn_to_use = causal_mask_fn if causal else None
+#   block_mask_fn_to_use = causal_block_mask_fn if causal else None
+
+
+#   print("Running Pallas TPU flash attention kernel (Forward Setup)...")
+  
+#   # Note: _mha_reference generally handles 'causal' arg internally. 
+#   o_ref, l_ref, m_ref = mha_reference(
+#       q=q, k=k, v=v,sm_scale=sm_scale,
+#       save_residuals=save_residuals,
+#       causal=causal # Ensure reference knows it is causal
+#   )
+
+#   o, l, m = _flex_attention_impl(
+#       q=q, k=k, v=v, ab=ab, segment_ids=segment_ids,
+#       save_residuals=save_residuals,
+#       causal=causal, sm_scale=sm_scale,
+#       block_b=block_b, block_q=block_q_major,
+#       block_k_major=block_k_major, block_k=block_k,
+#       debug=debug, score_fn=None,
+#       mask_fn=mask_fn_to_use,            # Passed
+#       block_mask_fn=block_mask_fn_to_use # Passed
+#   )
+
+#   print(f"o diff: {jnp.linalg.norm(o_ref - o)/jnp.linalg.norm(o_ref):.3e}")
+#   print(f"l diff: {jnp.linalg.norm(l_ref - l)/jnp.linalg.norm(l_ref):.3e}")
+#   print(f"m diff: {jnp.linalg.norm(m_ref - m)/(jnp.linalg.norm(m_ref) + 1e-6):.3e}")
+
+#   di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)
+
+#   # --- Benchmark ---
+#   def my_score(q, k):
+#     logits = jnp.dot(q, k.T)
+#     return 30 * jnp.tanh(logits / 30)
+  
+#   jax_score = make_jax_score_fn(my_score)
+
+#   results = run_bench_suite(
+#       k=k, v=v, q=q, l=l, m=m, di=di, do=do, o=o, ab=ab, segment_ids=segment_ids,
+#       sm_scale=sm_scale,
+#       block_b=block_b,
+#       block_q=block_q,
+#       block_k_major=block_k_major,
+#       block_q_major=block_q_major,
+#       block_k=block_k,
+#       causal=causal,
+#       score_fn=jax_score,
+#       mask_fn=None,            # Passed
+#       block_mask_fn=None # Passed
+#   )
+
+#   print("\nSummary:", results)
+
+# if __name__ == "__main__":
+#   main()
+def generate_doc_lengths(total_len, num_docs, seed=0):
+    """
+    Generates a list of random document lengths that sum exactly to total_len.
+    Ensures no document has 0 length.
+    """
+    np.random.seed(seed)
+    
+    if num_docs <= 0:
+        return [total_len]
+    if num_docs > total_len:
+        raise ValueError("Cannot have more documents than tokens!")
+
+    # 1. Generate split points
+    splits = np.sort(
+        np.random.choice(range(1, total_len), num_docs - 1, replace=False)
+    )
+    
+    # 2. Add start (0) and end (total_len)
+    boundaries = np.concatenate(([0], splits, [total_len]))
+    
+    # 3. Calculate lengths (distance between cuts)
+    lengths = np.diff(boundaries)
+    
+    return lengths.tolist()
+
 def main():
-  key = random.PRNGKey(0)
-  batch = 1
-  heads = 1
-  q_len = 12800
-  kv_len = 12800
-  head_dim = 256
+    print("=== FlexAttention dK/dV Backward Benchmark & Verification ===\n")
 
-  k1, k2, k3, k4 = random.split(key, 4)
-  q = random.normal(k1, (batch, heads, q_len, head_dim), dtype=jnp.float32)
-  k = random.normal(k2, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
-  v = random.normal(k3, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
-  do = random.normal(k4, (batch, heads, q_len, head_dim), dtype=jnp.float32)
-  ab = None
-  segment_ids = None
+    # 1. Hardware / Data Config
+    # -------------------------
+    key = random.PRNGKey(0)
+    batch, heads = 1, 8
+    q_len, kv_len = 4096, 4096
+    head_dim = 128
 
-  block_b = 1
-  block_q_major = 512
-  block_q = 128
-  block_k_major = 512
-  block_k = 128
+    # Block sizes (must match your dkv bwd kernel tiling)
+    block_b = 1
+    block_q = 1024           # used by dkv kernel
+    block_q_major = 1024     # if your impl distinguishes "major" q-blocks
+    block_k_major = 1024
+    block_k = 1024
 
-  causal = False
-  sm_scale = float(1.0 / jnp.sqrt(head_dim).astype(jnp.float32))
-  debug = False
-  save_residuals = True
+    # 2. Generate Inputs (BF16 for TPU speed)
+    # -------------------------
+    print(f"Generating inputs: B={batch}, H={heads}, L={q_len}, D={head_dim} (BF16)...")
+    k1, k2, k3, k4, key = random.split(key, 5)
+    q = random.normal(k1, (batch, heads, q_len, head_dim), dtype=jnp.bfloat16)
+    k = random.normal(k2, (batch, heads, kv_len, head_dim), dtype=jnp.bfloat16)
+    v = random.normal(k3, (batch, heads, kv_len, head_dim), dtype=jnp.bfloat16)
+    do = random.normal(k4, (batch, heads, q_len, head_dim), dtype=jnp.bfloat16)
+
+    ab = None
+    segment_ids = None
+    sm_scale = 1.0
+
+    # 3. Define Test Cases (same semantics as dq main)
+    # -------------------------
+    test_cases = []
+
+    test_cases.append({
+        "name": "Causal Attention",
+        "factory": masks.make_causal_mask_fns,
+        "factory_args": (),   # no extra args
+        "ref_args": {"causal": True},
+    })
+
+    # --- Case B: Sliding Window ---
+    window_size = 1024
+    test_cases.append({
+        "name": f"Sliding Window (W={window_size})",
+        "factory": masks.make_sliding_window_mask_fns,
+        "factory_args": (window_size,),
+        "ref_args": {"causal": False, "window_size": window_size},
+    })
+
+    # --- Case C: Jagged Documents (Randomized) ---
+    doc_lengths = generate_doc_lengths(total_len=q_len, num_docs=5, seed=42)
+    print(f"Generated Doc Lengths: {doc_lengths}")
+
+    # Build segment IDs for the reference (shape [B, L])
+    ref_ids_list = []
+    for i, length in enumerate(doc_lengths):
+        ref_ids_list.append(jnp.full((length,), i, dtype=jnp.int32))
+    jagged_ids_ref = jnp.concatenate(ref_ids_list)
+    jagged_ids_ref = jnp.tile(jagged_ids_ref[None, :], (batch, 1))
+
+    test_cases.append({
+        "name": f"Jagged Masking ({len(doc_lengths)} Docs)",
+        "factory": masks.make_jagged_mask_fns,
+        "factory_args": (doc_lengths,),
+        "ref_args": {
+            "causal": True,
+            "segment_ids": jagged_ids_ref,
+        },
+    })
+
+    # --- Case D: ALiBi (Score Function) ---
+    alibi_fn = make_jax_score_fn(
+        scores.make_alibi_score_fn(slope=0.5)
+    )
+    test_cases.append({
+        "name": "ALiBi Attention",
+        "factory": lambda *args: (None, None),  # no masks: score_fn only
+        "factory_args": (),
+        "ref_args": {
+            "score_fn": alibi_fn,
+            "alibi_slope": 0.5,
+            "causal": False,
+        },
+    })
+
+    # --- Case E: Tanh Soft-Capping (Score Function) ---
+    tanh_fn = make_jax_score_fn(
+        scores.make_softcap_score_fn(cap=30.0)
+    )
+    test_cases.append({
+        "name": "Tanh Soft-Capping",
+        "factory": lambda *args: (None, None),
+        "factory_args": (),
+        "ref_args": {
+            "score_fn": tanh_fn,
+            "causal": False,
+        },
+    })
+
+    # (If you later want causal / sliding / jagged, you can reuse the same
+    # factories & ref_args pattern from the dq main and just extend test_cases.)
+
+    # 4. Run Loop over Mask / Score Configurations
+    # -------------------------
+    for case in test_cases:
+        print("\n" + "=" * 60)
+        print(f"RUNNING (Backward): {case['name']}")
+        print("=" * 60)
+
+        # A. Build the masks
+        factory_fn = case["factory"]
+        extra_args = case["factory_args"]
+
+        try:
+            # NOTE: our factories are defined as:
+            #   causal:  make_causal_mask_fns(block_q, block_k_major)
+            #   others:  make_*_mask_fns(block_q, block_k, ...)
+            # Passing block_k_major as "block_k" for the non-causal cases is OK
+            # as long as it matches the tiling used in the kernel.
+            mask_fn, block_mask_fn = factory_fn(
+                block_q, block_k_major, *extra_args
+            )
+        except AttributeError:
+            print(f"Skipping {case['name']} (factory not found in masks.py)")
+            continue
+
+        # B. Prepare arguments for backward benchmark
+        current_args = {
+            "sm_scale": 1.0,
+            "block_b": 1,
+            "block_q": block_q,
+            "block_q_major": block_q_major,
+            "block_k_major": block_k_major,
+            "block_k": block_k,
+            "mask_fn": mask_fn,
+            "block_mask_fn": block_mask_fn
+        }
+        current_args.update(case["ref_args"])
+
+        sm_scale = 1.0
+        o, l, m = mha_reference(
+            q.astype(jnp.float32),
+            k.astype(jnp.float32),
+            v.astype(jnp.float32),
+            sm_scale=sm_scale,
+            save_residuals=True,
+        )
+
+        # 3. Generate dO and compute the scalar "d" (di) term
+        #    IMPORTANT: use a PRNG key, NOT the tensor k
+        key, key_do = random.split(key)
+        do = random.normal(key_do, o.shape, dtype=jnp.bfloat16)
+        d = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)
+
+        # C. Run backward benchmark suite
+        results = run_bench_suite(
+            q, k, v, l, m, o, do, d,
+            **current_args,
+        )
+
+        print("Backward summary:", results)
+
+    print("\n=== All Backward Tests Completed ===")
 
 
-  print("Running Pallas TPU flash attention kernel...")
-  o_ref, l_ref, m_ref = mha_reference (
-      q=q, k=k, v=v,
-      save_residuals=save_residuals
-  )
-
-  o, l, m = _flex_attention_impl(
-      q=q, k=k, v=v, ab=ab, segment_ids=segment_ids,
-      save_residuals=save_residuals,
-      causal=causal, sm_scale=sm_scale,
-      block_b=block_b, block_q=block_q_major,
-      block_k_major=block_k_major, block_k=block_k,
-      debug=debug,score_fn=None
-  )
-
-  print(f"o diff: {jnp.linalg.norm(o_ref - o)/jnp.linalg.norm(o_ref):.3e}")
-  print(f"l diff: {jnp.linalg.norm(l_ref - l)/jnp.linalg.norm(l_ref):.3e}")
-  print(f"m diff: {jnp.linalg.norm(m_ref - m)//jnp.linalg.norm(m_ref):.3e}")
-
-  
-
-  di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)
-
-#performence comparison
-#Run the benchmark comparison
-  def my_score(q, k):
-      return jnp.einsum("qd, kd -> qk", q, k)
-  
-  jax_score = make_jax_score_fn(my_score)
-  results = run_bench_suite(
-      k=k, v=v, q=q, l=l, m=m, di=di, do=do, o=o, ab=ab, segment_ids=segment_ids,
-      sm_scale=sm_scale,
-      block_b=block_b,
-      block_q=block_q,
-      block_k_major=block_k_major,
-      block_q_major=block_q_major,
-      block_k=block_k,
-      causal=causal,
-      score_fn=jax_score
-  )
-
-  print("\nSummary:", results)
 
 if __name__ == "__main__":
-  main()
+    main()
+
+# --- TPU v5e Specs (Approximate) ---
+TPU_PEAK_TFLOPS = 197.0
+TPU_PEAK_BW = 819.0  # GB/s
+
+def get_theoretical_metrics_fwd(b, h, l, d, causal=True, dtype_bytes=2):
+    """Same as your forward model: ~4 * B * H * L^2 * D FLOPs."""
+    total_elements = 4 * (b * h * l * d)          # Q, K, V, O
+    total_bytes = total_elements * dtype_bytes
+
+    total_flops = 4 * b * h * (l * l) * d
+    if causal:
+        total_flops /= 2.0
+    return total_flops, total_bytes
+
+def get_theoretical_metrics_bwd(b, h, l, d, causal=True, dtype_bytes=2):
+    """
+    Approximate FLOP/byte model for the backward pass.
+
+    FLOPs:
+      - Backward of attention is more expensive than forward.
+      - A simple and reasonable approximation is 2x forward FLOPs.
+    IO:
+      - Read: Q, K, V, O, dO, l, m     (~7 tensors)
+      - Write: dQ, dK, dV              (~3 tensors)
+      For roofline we just count the main tensors and use 7 * B * H * L * D.
+    """
+    fwd_flops, _ = get_theoretical_metrics_fwd(b, h, l, d, causal=causal,
+                                               dtype_bytes=dtype_bytes)
+    total_flops = 2.0 * fwd_flops  # heuristic: bwd ≈ 2× fwd
+
+    total_elements = 7 * (b * h * l * d)  # Q,K,V,O,dO,l,m (approx)
+    total_bytes = total_elements * dtype_bytes
+
+    return total_flops, total_bytes
+
+# def main():
+#     key = random.PRNGKey(0)
+
+#     # Constants
+#     BATCH = 1
+#     HEADS = 8
+#     DIM = 128
+
+#     # Block sizes (keep constant)
+#     BLOCK_Q = 1024
+#     BLOCK_K_MAJOR = 1024
+#     BLOCK_K = 1024
+
+#     # Sequence length sweep (same style as fwd)
+#     SEQ_LENS = [1024 * (2 ** i) for i in range(5)]  # 1k, 2k, 4k, 8k, 16k
+
+#     results_data = []
+
+#     print(f"{'SeqLen':<10} | {'Time(ms)':<10} | {'TFLOP/s':<10} | {'Intensity':<10}")
+#     print("-" * 55)
+
+#     def my_score(q, k):
+#         # Tile-local score; wrapped by make_jax_score_fn
+#         return jnp.einsum("qd,kd->qk", q, k)
+
+#     for L in SEQ_LENS:
+#         # 1. Generate inputs
+#         k1, k2, k3, k4, key = random.split(key, 5)
+
+#         # Use bf16 for inputs to match TPU execution mode
+#         q = random.normal(k1, (BATCH, HEADS, L, DIM), dtype=jnp.bfloat16)
+#         k = random.normal(k2, (BATCH, HEADS, L, DIM), dtype=jnp.bfloat16)
+#         v = random.normal(k3, (BATCH, HEADS, L, DIM), dtype=jnp.bfloat16)
+
+#         # 2. Forward pass (reference) to get O, l, m
+#         sm_scale = 1.0
+#         o, l, m = mha_reference(
+#             q.astype(jnp.float32),
+#             k.astype(jnp.float32),
+#             v.astype(jnp.float32),
+#             sm_scale=sm_scale,
+#             save_residuals=True,
+#         )
+
+#         # 3. Generate dO and compute the scalar "d" (di) term
+#         do = random.normal(k4, o.shape, dtype=jnp.bfloat16)
+#         d = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)
+
+#         # 4. Build mask + score functions
+#         # mask_fn, block_mask_fn = make_causal_mask_fns(
+#         #     block_q=BLOCK_Q, block_k_major=BLOCK_K_MAJOR
+#         # )
+#         jax_score = make_jax_score_fn(my_score)
+
+#         # 5. Jitted backward kernel
+#         def bwd_call(q_, k_, v_, o_, l_, m_, do_, d_):
+#             return flash_attention_bwd_dkv(
+#                 q=q_, k=k_, v=v_,
+#                 ab=None,
+#                 l=l_, m=m_,
+#                 do=do_,di=d_,
+#                 block_q=BLOCK_Q,
+#                 block_k_major=BLOCK_K_MAJOR,
+#                 block_k=BLOCK_K,
+#                 block_q_major=BLOCK_Q,
+#                 sm_scale=sm_scale,
+#                 debug=False,
+#                 score_fn=None,
+#                 mask_fn=None,
+#                 block_mask_fn=None,
+#                 causal=False
+#             )
+
+#         bwd_jit = jax.jit(bwd_call)
+
+#         # 6. Benchmark backward kernel only
+#         _, time_sec = benchmark(
+#             bwd_jit,
+#             (q, k, v, o, l, m, do, d),
+#             name=f"flex_bwd_dq_L{L}",
+#         )
+
+#         # 7. Theoretical FLOPs and bytes for backward
+#         flops, bytes_moved = get_theoretical_metrics_bwd(
+#             BATCH, HEADS, L, DIM, causal=True, dtype_bytes=2
+#         )
+
+#         tflops_per_sec = (flops / 1e12) / time_sec
+#         intensity = flops / bytes_moved
+
+#         print(f"{L:<10} | {time_sec * 1e3:<10.2f} | {tflops_per_sec:<10.2f} | {intensity:<10.2f}")
+
+#         results_data.append({
+#             "SeqLen": L,
+#             "Time_Sec": float(time_sec),
+#             "TFLOPs": float(tflops_per_sec),
+#             "Intensity": float(intensity),
+#         })
+
+#     # 8. Save CSV for backward roofline plot
+#     df = pd.DataFrame(results_data)
+#     df.to_csv("roofline_data_bwd_dkv.csv", index=False)
+#     print("\nSaved backward sweep data to roofline_data_bwd.csv")
+
+# if __name__ == "__main__":
+#     main()

@@ -120,57 +120,118 @@ def mha_bwd_reference(
     ab: jax.Array | None = None,
     *,
     causal: bool = False,
-    mask_value: float = None,
+    mask_value: float | None = None,   # kept for API compatibility, not used
     sm_scale: float = 1.0,
-    save_residuals: bool = True,
-    score_fn = None
+    save_residuals: bool = True,       # kept for API compatibility, not used
+    score_fn=None,
+    window_size: int | None = None,
+    segment_ids: jax.Array | None = None,
+    s2_stride: int | None = None,
+    alibi_slope: float | None = None,
 ):
-    batched_score = jax.vmap(
-            jax.vmap(score_fn, in_axes=(0, 0)), 
-            in_axes=(0, 0)
-        )
-    
-    if score_fn is None:
-        logits = jnp.einsum("bhqc,bhkc->bhqk", q, k)
+    """
+    Backward pass that exactly mirrors `mha_reference`.
+    Returns gradients w.r.t q, k, v.
+    """
+
+    batch, heads, q_len, dim = q.shape
+    k_len = k.shape[2]
+
+    # -------------------------
+    # Rebuild logits exactly as in mha_reference
+    # -------------------------
+    if score_fn is None or alibi_slope is not None:
+        # Dot-product path (also used when ALiBi is active, even if score_fn is provided)
+        logits = jnp.einsum("bhqc,bhkc->bhqk", q, k) * sm_scale
+
+        if alibi_slope is not None:
+            # Same ALiBi logic as in forward
+            q_idx_alibi = jnp.arange(q_len)[:, None] % 1024
+            k_idx_alibi = jnp.arange(k_len)[None, :] % 512
+            dist = jnp.abs(q_idx_alibi - k_idx_alibi)
+            logits = logits - (alibi_slope * dist)
+
+        batched_score = None
     else:
-        logits = batched_score(q, k)
-    print(f"DEBUG: logits shape: {logits.shape}")
+        # score_fn path (no sm_scale in forward)
+        score_fn_batched = jax.vmap(
+            jax.vmap(score_fn, in_axes=(0, 0)),
+            in_axes=(0, 0),
+        )
+        logits = score_fn_batched(q, k)
+        batched_score = score_fn_batched
+
     if ab is not None:
-        logits += ab
-    if sm_scale != 1.0:
-        logits *= sm_scale
+        logits = logits + ab
 
-    # # no causal masking
-    # mask = None
-    # logits = logits if mask is None else logits + jnp.where(mask, 0.0, -1e9)
+    # Prepare indices for masking (same as forward)
+    q_idx = jnp.arange(q_len)[:, None]  # (Q, 1)
+    k_idx = jnp.arange(k_len)[None, :]  # (1, K)
 
-    # m = logits.max(axis=-1)
-    unnormalized = jnp.exp(logits - m)
-    # l = unnormalized.sum(axis=-1)
-    # weights = unnormalized / l[..., None]
-    # o = jnp.einsum("bhkq,bhkc->bhqc", weights, v)
-    print(f"DEBUG: m shape: {m.shape}")
-    print(f"DEBUG: unnormalized shape: {unnormalized.shape}")
-    p = unnormalized / l
-    print(f"DEBUG: l shape: {l.shape}")
-    print(f"DEBUG: p shape: {p.shape}")
+    # Causal mask
+    if causal:
+        causal_mask = k_idx > q_idx
+        logits = jnp.where(causal_mask, -1e9, logits)
 
-    # dv = P^T * do
+    # Document (segment) mask
+    if segment_ids is not None:
+        if segment_ids.ndim == 1:
+            ids_q = segment_ids[None, None, :, None]  # (1, 1, Q, 1)
+            ids_k = segment_ids[None, None, None, :]  # (1, 1, 1, K)
+        else:
+            ids_q = segment_ids[:, None, :, None]     # (B, 1, Q, 1)
+            ids_k = segment_ids[:, None, None, :]     # (B, 1, 1, K)
+
+        doc_mask = ids_q != ids_k
+        logits = jnp.where(doc_mask, -1e9, logits)
+
+    # Sliding window / S2 mask
+    if window_size is not None:
+        dist = q_idx - k_idx
+        should_mask = dist >= window_size
+
+        if s2_stride is not None:
+            is_strided_token = (k_idx % s2_stride == 0)
+            should_mask = should_mask & (~is_strided_token)
+
+        logits = jnp.where(should_mask, -1e9, logits)
+
+    # -------------------------
+    # Reconstruct softmax probabilities from (logits, m, l)
+    # -------------------------
+    # forward: m = max(logits), l = sum(exp(logits - m))
+    unnormalized = jnp.exp(logits - m[..., None])  # [B, H, Q, K]
+
+    # handle fully-masked rows (l == 0) the same way as forward
+    l_safe = jnp.where(l == 0, 1.0, l)
+    p = unnormalized / l_safe[..., None]           # [B, H, Q, K]
+
+    # -------------------------
+    # Backprop through softmax + V
+    # -------------------------
+    # dv = P^T * dO
     dv = jnp.einsum("bhqk,bhqc->bhkc", p, do)
 
-    # dp = do * V^T
+    # dp = dO * V^T
     dp = jnp.einsum("bhqc,bhkc->bhqk", do, v)
 
-    # software backward
-    sum_d = jnp.sum(do*o, axis=-1)
-    ds = p * (dp - sum_d[..., None])
+    # softmax backward:
+    # sum_d = Σ_k p_k * dp_k = (dO · O) per (B,H,Q)
+    sum_d = jnp.sum(do * o, axis=-1)              # [B, H, Q]
+    ds = p * (dp - sum_d[..., None])              # dL/d(logits)
 
-    if score_fn is None:
-        dq = jnp.einsum("bhqk,bhkc->bhqc", ds, k)
-        dk = jnp.einsum("bhqk,bhqc->bhkc", ds, q)
+    # -------------------------
+    # Backprop to q, k
+    # -------------------------
+    if score_fn is None or alibi_slope is not None:
+        # logits = sm_scale * <q, k> (+ ALiBi bias)
+        # ∂logits/∂q = sm_scale * k; ∂logits/∂k = sm_scale * q
+        ds_scaled = ds * sm_scale
+        dq = jnp.einsum("bhqk,bhkc->bhqc", ds_scaled, k)
+        dk = jnp.einsum("bhqk,bhqc->bhkc", ds_scaled, q)
     else:
+        # score_fn path: use VJP of the batched score function
         _, vjp_fn = jax.vjp(batched_score, q, k)
         dq, dk = vjp_fn(ds)
-
 
     return dq, dk, dv

@@ -1,5 +1,10 @@
 import jax.numpy as jnp
 
+def place_holder(block_q, block_k_major):
+    def p(q_block_idx, k_block_idx):
+        return True
+    return p,p
+
 def make_causal_mask_fns(block_q, block_k_major):
     """
     Returns a tuple of (mask_fn, block_mask_fn) closures capturing the block sizes.

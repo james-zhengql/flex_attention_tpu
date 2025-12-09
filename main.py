@@ -4,7 +4,7 @@ import jax
 import scores
 from jax import random
 import jax.numpy as jnp
-import benchmark 
+import benchmark_fwd 
 import masks # Assumes this contains the factory functions we defined earlier
 import numpy as np
 import util
@@ -54,7 +54,7 @@ def main():
     # Block Sizes (Must match what fits in your VMEM)
     block_q = 1024
     block_k_major = 1024
-    block_k = 512
+    block_k = 1024
 
     # 2. Generate Inputs (BF16 for TPU Speed)
     # -------------------------
@@ -73,9 +73,9 @@ def main():
     # --- Case A: Standard Causal ---
     test_cases.append({
         "name": "Causal Attention",
-        "factory": masks.make_causal_mask_fns,
+        "factory": masks.place_holder,
         "factory_args": (), # No extra args needed for causal factory
-        "ref_args": {"causal": True}
+        "ref_args": {"causal": False}
     })
 
     # # --- Case B: Sliding Window ---
@@ -165,7 +165,7 @@ def main():
         current_ref_args.update(case["ref_args"])
 
         # C. Run Benchmark
-        results = benchmark.run_bench_suite(
+        results = benchmark_fwd.run_bench_suite(
             q, k, v,
             **current_ref_args
         )
